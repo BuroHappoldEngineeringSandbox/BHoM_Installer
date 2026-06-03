@@ -1,7 +1,6 @@
 BHoM/AGS_Toolkit
 BHoM/EmbodiedSuffering_Toolkit
 BHoM/Karamba3D_Toolkit
-BHoM/OpenAI_Toolkit
 BHoM/PowerPoint_Toolkit
 BHoM/SAP_Toolkit
 BHoM/SQLite_Toolkit
