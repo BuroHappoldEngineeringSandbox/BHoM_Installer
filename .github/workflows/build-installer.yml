@@ -1,14 +1,19 @@
 # Build Installer. GitHub Actions replacement for BHoMBot's 00:45 UTC alpha build.
 #
-# Triggers:
-#   schedule           Nightly 00:45 UTC, fires on the default branch only.
-#                      Schedule events do not pass workflow inputs, so the
-#                      build defaults to release_type=alpha (handled in
-#                      Build-Installer.ps1 via 'inputs.release_type || alpha').
-#   workflow_dispatch  Manual run for iteration and ad-hoc test builds.
+# Triggers and the release flavours they produce (all parameters resolved by
+# the 'resolve' job below):
 #
-# Trigger to be added later:
-#   push: tags v*      Phase 2+, tagged release builds for beta-test and stable.
+#   schedule            Nightly alpha. Fires 00:45 UTC on the default branch
+#                       only. release_type=alpha, prerelease=true.
+#
+#   workflow_dispatch   Manual run. The 'release_type' input chooses alpha or
+#                       beta; beta is intended for use during a feature-freeze
+#                       window. prerelease=true in both cases.
+#
+#   push: tags 'v*'     Finalised release. The tag (e.g. v9.2.0) is pushed to
+#                       the default branch after a develop -> main merge.
+#                       release_type=beta, prerelease=false, marked as the
+#                       Latest release on the Releases page.
 
 name: Build Installer
 
@@ -23,7 +28,10 @@ on:
           - beta
         default: alpha
       patch_version:
-        description: 'Patch version (yyMMdd). Blank = today.'
+        description: |
+          Patch version. For alpha, blank means today's date (YYMMDD).
+          For beta, blank means '0'; increment only when reissuing a
+          beta release with a hotfix on the same major.minor milestone.
         type: string
         required: false
         default: ''
@@ -31,12 +39,93 @@ on:
   schedule:
     - cron: '45 0 * * *'   # 00:45 UTC nightly, matching BHoMBot
 
+  push:
+    tags:
+      - 'v*'
+
 permissions:
   contents: read
 
 jobs:
+  # Normalise the trigger event into the parameters every downstream job
+  # needs. Single source of truth for: which release type to build, what
+  # patch version to pass to MSBuild, what branch each dep should be
+  # cloned from, and how the GitHub Release should be flagged.
+  resolve:
+    name: Resolve release parameters
+    runs-on: ubuntu-latest
+    outputs:
+      release_type:  ${{ steps.r.outputs.release_type }}
+      patch_version: ${{ steps.r.outputs.patch_version }}
+      main_branch:   ${{ steps.r.outputs.main_branch }}
+      prerelease:    ${{ steps.r.outputs.prerelease }}
+      make_latest:   ${{ steps.r.outputs.make_latest }}
+      release_tag:   ${{ steps.r.outputs.release_tag }}
+    steps:
+      - id: r
+        shell: bash
+        env:
+          INPUT_RELEASE_TYPE:  ${{ inputs.release_type }}
+          INPUT_PATCH_VERSION: ${{ inputs.patch_version }}
+        run: |
+          set -eu
+
+          case "$GITHUB_EVENT_NAME" in
+            schedule)
+              release_type=alpha
+              patch_version=""        # Build-Installer.ps1 defaults to today (YYMMDD)
+              main_branch=develop
+              prerelease=true
+              make_latest=false
+              release_tag=""          # publish step composes 'alpha-{YYYYMMDD-HHMMSS}'
+              ;;
+
+            workflow_dispatch)
+              release_type="${INPUT_RELEASE_TYPE:-alpha}"
+              patch_version="$INPUT_PATCH_VERSION"
+              main_branch=develop     # dispatch builds always track develop tip
+              prerelease=true
+              make_latest=false
+              release_tag=""          # publish step composes a timestamped tag
+              ;;
+
+            push)
+              # Tag push 'v*'. Tag schema mirrors BHoMBot's beta convention:
+              # v{major}.{minor}.{patch} where patch defaults to 0 and is the
+              # hotfix counter within the major.minor milestone.
+              release_type=beta
+              main_branch=main        # deps build against main, matching the tag
+              prerelease=false
+              make_latest=true
+              release_tag="$GITHUB_REF_NAME"
+
+              # Extract the patch component from the tag. Expected forms:
+              #   v9.2     -> patch 0
+              #   v9.2.0   -> patch 0
+              #   v9.2.1   -> patch 1
+              ver="${GITHUB_REF_NAME#v}"
+              IFS='.' read -r _ _ patch _ <<<"$ver"
+              patch_version="${patch:-0}"
+              ;;
+
+            *)
+              echo "::error::Unsupported event '$GITHUB_EVENT_NAME'"
+              exit 1
+              ;;
+          esac
+
+          echo "release_type=$release_type"   >> "$GITHUB_OUTPUT"
+          echo "patch_version=$patch_version" >> "$GITHUB_OUTPUT"
+          echo "main_branch=$main_branch"     >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease"       >> "$GITHUB_OUTPUT"
+          echo "make_latest=$make_latest"     >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag"     >> "$GITHUB_OUTPUT"
+
+          echo "::notice::release_type=$release_type, patch_version='$patch_version', main_branch=$main_branch, prerelease=$prerelease, release_tag='$release_tag'"
+
   build:
-    name: Build ${{ inputs.release_type || 'alpha' }} installer
+    name: Build ${{ needs.resolve.outputs.release_type }} installer
+    needs: resolve
     runs-on: windows-2025-vs2026
     timeout-minutes: 180   # generous; tighten once we know real duration
     defaults:
@@ -131,16 +220,18 @@ jobs:
 
       - name: Build installer
         id: build
+        env:
+          RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
+          PATCH_VERSION: ${{ needs.resolve.outputs.patch_version }}
+          MAIN_BRANCH:   ${{ needs.resolve.outputs.main_branch }}
         run: |
-          $releaseType = '${{ inputs.release_type }}'
-          if (-not $releaseType) { $releaseType = 'alpha' }
-
-          $patchVersion = '${{ inputs.patch_version }}'
-
           # Hashtable splat (not array) so PowerShell binds by parameter name.
-          # Array splatting was treating '-ReleaseType' as a positional value.
-          $splat = @{ ReleaseType = $releaseType }
-          if ($patchVersion) { $splat['PatchVersion'] = $patchVersion }
+          # Array splatting would otherwise treat '-ReleaseType' as a value.
+          $splat = @{
+              ReleaseType = $env:RELEASE_TYPE
+              MainBranch  = $env:MAIN_BRANCH
+          }
+          if ($env:PATCH_VERSION) { $splat['PatchVersion'] = $env:PATCH_VERSION }
 
           & "$env:GITHUB_WORKSPACE\scripts\Build-Installer.ps1" @splat
 
@@ -151,7 +242,8 @@ jobs:
         # and diffs it against this one to render "what changed since last build"
         # release notes.
         env:
-          RELEASE_TYPE: ${{ inputs.release_type || 'alpha' }}
+          RELEASE_TYPE: ${{ needs.resolve.outputs.release_type }}
+          MAIN_BRANCH:  ${{ needs.resolve.outputs.main_branch }}
         run: |
           $depsObject = [ordered]@{}
           Get-ChildItem 'D:\a\BHoM_Installer' -Directory -ErrorAction SilentlyContinue |
@@ -163,7 +255,7 @@ jobs:
                       $orgRepo = "$($Matches[1])/$($Matches[2])"
                       $sha = (git -C $_.FullName rev-parse HEAD 2>$null).Trim()
                       if ($sha) {
-                          $depsObject[$orgRepo] = [ordered]@{ branch = 'develop'; sha = $sha }
+                          $depsObject[$orgRepo] = [ordered]@{ branch = $env:MAIN_BRANCH; sha = $sha }
                       }
                   }
               }
@@ -172,7 +264,7 @@ jobs:
               version       = 1
               built_at      = (Get-Date).ToUniversalTime().ToString('o')
               release_type  = $env:RELEASE_TYPE
-              main_branch   = 'develop'
+              main_branch   = $env:MAIN_BRANCH
               deps          = $depsObject
           }
 
@@ -198,7 +290,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: installer-${{ inputs.release_type || 'alpha' }}-${{ github.run_id }}
+          name: installer-${{ needs.resolve.outputs.release_type }}-${{ github.run_id }}
           path: |
             ${{ github.workspace }}/Build/*.msi
             ${{ github.workspace }}/Build/dep-manifest.json
@@ -215,7 +307,7 @@ jobs:
   # Explicit runner labels rather than windows-latest for reproducibility.
   install-test:
     name: Install + uninstall (${{ matrix.os }})
-    needs: build
+    needs: [resolve, build]
     strategy:
       fail-fast: false
       matrix:
@@ -229,7 +321,7 @@ jobs:
       - name: Download .msi artefact
         uses: actions/download-artifact@v4
         with:
-          name: installer-${{ inputs.release_type || 'alpha' }}-${{ github.run_id }}
+          name: installer-${{ needs.resolve.outputs.release_type }}-${{ github.run_id }}
           path: msi
 
       - name: Install
@@ -356,25 +448,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # Publish the .msi as a preserved per-build Release. Single tag scheme for
-  # both triggers:
-  #   alpha-{YYYYMMDD-HHMMSS}
-  # The 'Triggered by:' line in the release body distinguishes scheduled
-  # nightlies from manual dispatches; there is no need to encode that in the
-  # tag itself. Each release is preserved (no rolling tag, no overwrite) and
-  # history accumulates indefinitely.
+  # Publish the .msi as a preserved per-build GitHub Release. The flavour
+  # is determined by what triggered the run, normalised in the resolve job:
   #
-  # Gated on the entire pipeline succeeding (build + install-test). Failed
-  # builds do not appear on the Releases page. The .msi remains accessible
-  # from the workflow run's "Upload installer artefact" Actions artifact for
-  # local debugging when smoke tests fail.
-  publish-alpha:
-    name: Publish alpha release
-    needs: [build, install-test]
-    if: |
-      success() &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
-      (inputs.release_type == 'alpha' || inputs.release_type == null || inputs.release_type == '')
+  #   schedule        alpha       prerelease=true   tag = alpha-{YYYYMMDD-HHMMSS}
+  #   dispatch alpha  alpha       prerelease=true   tag = alpha-{YYYYMMDD-HHMMSS}
+  #   dispatch beta   beta        prerelease=true   tag = beta-{YYYYMMDD-HHMMSS}
+  #   push v*         beta        prerelease=false  tag = the git tag (e.g. v9.2.0), marked Latest
+  #
+  # Each release is preserved (no rolling tag, no overwrite). History
+  # accumulates indefinitely. Gated on the entire pipeline succeeding
+  # (build + install-test). Failed builds do not appear on the Releases
+  # page; the .msi is still accessible from the workflow run's
+  # "Upload installer artefact" Actions artifact for local debugging.
+  publish:
+    name: Publish ${{ needs.resolve.outputs.release_type }} release
+    needs: [resolve, build, install-test]
+    if: success()
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -392,21 +482,38 @@ jobs:
       - name: Download current .msi + dep-manifest.json
         uses: actions/download-artifact@v4
         with:
-          name: installer-${{ inputs.release_type || 'alpha' }}-${{ github.run_id }}
+          name: installer-${{ needs.resolve.outputs.release_type }}-${{ github.run_id }}
           path: artefact
 
       - name: Compute release tag and name
         id: tag
         shell: bash
+        env:
+          RESOLVED_TAG:  ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
         run: |
           set -eu
-          tag="alpha-$(date -u +%Y%m%d-%H%M%S)"
-          name="BHoM Alpha Installer ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)"
+          if [ -n "$RESOLVED_TAG" ]; then
+              # Tag-push event: reuse the git tag as the release tag.
+              tag="$RESOLVED_TAG"
+              name="BHoM ${RESOLVED_TAG} Release"
+          else
+              # Schedule or dispatch: compose a timestamped tag from the
+              # release type.
+              ts=$(date -u +%Y%m%d-%H%M%S)
+              tag="${RELEASE_TYPE}-${ts}"
+              case "$RELEASE_TYPE" in
+                  alpha) human="Alpha Installer" ;;
+                  beta)  human="Beta Installer" ;;
+                  *)     human="${RELEASE_TYPE^} Installer" ;;
+              esac
+              name="BHoM ${human} ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)"
+          fi
           echo "tag=$tag"   >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "::notice::Release tag = $tag"
 
-      - name: Find + download most recent prior alpha dep-manifest (for diff)
+      - name: Find + download previous dep-manifest (for diff)
         id: prev-manifest
         env:
           GH_TOKEN: ${{ github.token }}
@@ -414,13 +521,14 @@ jobs:
         run: |
           set -eu
           mkdir -p prev
-          # Most recent prior alpha release. Tag scheme is alpha-{timestamp},
-          # so a single anchored prefix is sufficient.
+          # Most recent prior alpha, beta, or v* release. Sorting by
+          # publishedAt to avoid the createdAt collision quirk where same-day
+          # releases share an underlying-tag-resource timestamp.
           prev_tag=$(gh release list \
               --repo "$GITHUB_REPOSITORY" \
               --limit 50 \
               --json tagName,publishedAt \
-              --jq "[.[] | select(.tagName | test(\"^alpha-\")) | select(.tagName != \"$CURRENT_TAG\")] | sort_by(.publishedAt) | reverse | .[0].tagName // \"\"")
+              --jq "[.[] | select(.tagName | test(\"^(alpha-|beta-|v)\")) | select(.tagName != \"$CURRENT_TAG\")] | sort_by(.publishedAt) | reverse | .[0].tagName // \"\"")
           if [ -n "$prev_tag" ] && gh release download "$prev_tag" \
               --repo "$GITHUB_REPOSITORY" \
               --pattern dep-manifest.json \
@@ -429,7 +537,7 @@ jobs:
               echo "path=prev/dep-manifest.json" >> "$GITHUB_OUTPUT"
               echo "prev_tag=$prev_tag"          >> "$GITHUB_OUTPUT"
           else
-              echo "::notice::No prior alpha release with a manifest. This will be an initial-baseline publish."
+              echo "::notice::No prior release with a dep-manifest. Publishing as an initial-baseline release."
               echo "path="     >> "$GITHUB_OUTPUT"
               echo "prev_tag=" >> "$GITHUB_OUTPUT"
           fi
@@ -452,23 +560,27 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.name }}
-          body_path: release-body.md
+          tag_name:    ${{ steps.tag.outputs.tag }}
+          name:        ${{ steps.tag.outputs.name }}
+          body_path:   release-body.md
           files: |
             artefact/*.msi
             artefact/dep-manifest.json
-          make_latest: false
-          prerelease: true
+          make_latest: ${{ needs.resolve.outputs.make_latest }}
+          prerelease:  ${{ needs.resolve.outputs.prerelease }}
 
-  # Open a GitHub Issue when a scheduled nightly fails so the breakage does
-  # not rot silently overnight. Only fires on schedule events (not on
-  # dispatch, on the grounds that the human triggering a dispatch is already
-  # aware of the run).
+  # Open a GitHub Issue when a non-interactive build fails, so the breakage
+  # does not rot silently. Fires on:
+  #   schedule           Scheduled nightly. Nobody is watching at 00:45 UTC.
+  #   push (tag v*)      Release publish. A failed release tag is at least as
+  #                      important as a failed nightly; the release coordinator
+  #                      tagged and expects it to succeed.
+  # Does NOT fire on workflow_dispatch failures: the human who triggered the
+  # run is already watching the Actions tab.
   notify-on-failure:
-    name: Open issue on failed nightly
+    name: Open issue on failed scheduled or tagged build
     needs: [build, install-test]
-    if: failure() && github.event_name == 'schedule'
+    if: failure() && (github.event_name == 'schedule' || github.event_name == 'push')
     runs-on: ubuntu-latest
     permissions:
       issues: write
