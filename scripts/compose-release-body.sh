@@ -24,8 +24,10 @@
 #   GITHUB_SHA           Provided by GitHub Actions.
 #   GITHUB_EVENT_NAME    Provided by GitHub Actions.
 #   GH_TOKEN             Token with 'actions: read' on the repo.
-#   PREV_TAG             Prior alpha release tag for the diff base, or
-#                        empty string if no prior release exists.
+#   RELEASE_TYPE         'alpha' or 'beta'. Drives the intro sentence.
+#   IS_PRERELEASE        'true' or 'false'. Drives the intro sentence.
+#   PREV_TAG             Prior release tag for the diff base, or empty
+#                        string if no prior release exists.
 #
 # Required local file:
 #   release-notes-section.md  Output from generate_release_notes.py.
@@ -39,7 +41,17 @@ run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 if [ -n "$PREV_TAG" ]; then
     diff_note="Changes are computed against [\`$PREV_TAG\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${PREV_TAG})."
 else
-    diff_note="No prior alpha release was found, so this build is published as an initial baseline."
+    diff_note="No prior release was found, so this build is published as an initial baseline."
+fi
+
+# Intro sentence varies by release flavour. Three cases:
+#   alpha prerelease      'Pre-release alpha build of the BHoM installer...'
+#   beta prerelease       'Pre-release beta build of the BHoM installer...'
+#   beta release (tag)    'Release build of the BHoM installer...'
+if [ "$IS_PRERELEASE" = "true" ]; then
+    intro="Pre-release ${RELEASE_TYPE} build of the BHoM installer produced by the CI pipeline. See the build provenance below before installing."
+else
+    intro="Release build of the BHoM installer produced by the CI pipeline from a tagged commit on main."
 fi
 
 # Per-OS test results from the workflow's Jobs API. Filter to install-test
@@ -71,7 +83,7 @@ if [ -z "$test_results_rows" ]; then
 fi
 
 cat >release-body.md <<EOF
-Pre-release build of the BHoM installer produced by the alpha CI pipeline. See the build provenance below before installing.
+${intro}
 
 ### Build provenance
 

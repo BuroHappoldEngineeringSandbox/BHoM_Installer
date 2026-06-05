@@ -553,8 +553,10 @@ jobs:
 
       - name: Compose full release body
         env:
-          GH_TOKEN: ${{ github.token }}
-          PREV_TAG: ${{ steps.prev-manifest.outputs.prev_tag }}
+          GH_TOKEN:      ${{ github.token }}
+          PREV_TAG:      ${{ steps.prev-manifest.outputs.prev_tag }}
+          RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
+          IS_PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
         run: bash scripts/compose-release-body.sh
 
       - name: Publish release
