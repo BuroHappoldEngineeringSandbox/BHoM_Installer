@@ -99,13 +99,21 @@ jobs:
               make_latest=true
               release_tag="$GITHUB_REF_NAME"
 
-              # Extract the patch component from the tag. Expected forms:
-              #   v9.2     -> patch 0
-              #   v9.2.0   -> patch 0
-              #   v9.2.1   -> patch 1
+              # Extract the patch component from the tag. Expected forms
+              # (any non-numeric suffix is ignored so semver pre-release
+              # identifiers and ad-hoc test suffixes both parse cleanly):
+              #   v9.2          -> patch 0
+              #   v9.2.0        -> patch 0
+              #   v9.2.1        -> patch 1
+              #   v9.2.0-rc.1   -> patch 0
+              #   v9.2.0-test   -> patch 0
               ver="${GITHUB_REF_NAME#v}"
-              IFS='.' read -r _ _ patch _ <<<"$ver"
-              patch_version="${patch:-0}"
+              if [[ "$ver" =~ ^[0-9]+\.[0-9]+(\.([0-9]+))? ]]; then
+                  patch_version="${BASH_REMATCH[2]:-0}"
+              else
+                  echo "::warning::Tag '$GITHUB_REF_NAME' does not match v{major}.{minor}[.{patch}]; using patch_version=0"
+                  patch_version=0
+              fi
               ;;
 
             *)
