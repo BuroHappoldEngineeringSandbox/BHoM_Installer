@@ -21,20 +21,26 @@ on:
   workflow_dispatch:
     inputs:
       release_type:
-        description: 'Release type'
+        description: |
+          alpha — alpha pre-release. Tag: vM.N.P-alpha.YYMMDD[.counter]
+          beta  — beta pre-release (use during feature-freeze QA).
+                  Tag: vM.N.P-beta.counter
+          Final beta releases are produced ONLY by pushing a 'v*' git tag,
+          never via this dispatch.
         type: choice
         options:
           - alpha
           - beta
         default: alpha
-      patch_version:
+      source_branch:
         description: |
-          Patch version. For alpha, blank means today's date (YYMMDD).
-          For beta, blank means '0'; increment only when reissuing a
-          beta release with a hotfix on the same major.minor milestone.
+          Branch to build from. Default 'develop'.
+          Alpha-only: useful for testing a feature branch across deps that
+          share the branch name. Deps without the branch fall back to their
+          default branch. Beta ignores this input and always uses 'develop'.
         type: string
         required: false
-        default: ''
+        default: 'develop'
 
   schedule:
     - cron: '45 0 * * *'   # 00:45 UTC nightly, matching BHoMBot
