@@ -111,6 +111,26 @@ compute_beta_tag() {
     printf '%s.%d\n' "$prefix" "$((max + 1))"
 }
 
+# Validate that a pushed tag is of form v{M}.{N}.{P} (no pre-release suffix)
+# and that its M.N matches the wixproj. Exits non-zero with an ::error:: on
+# failure; prints the tag on success.
+validate_release_tag() {
+    local tag="$1" wix_m="$2" wix_n="$3"
+
+    if ! [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        err "Pushed tag '$tag' is not of form v{major}.{minor}.{patch} with no pre-release suffix. Final release tags only — push pre-release builds via workflow_dispatch instead."
+        return 2
+    fi
+
+    local tag_m="${BASH_REMATCH[1]}" tag_n="${BASH_REMATCH[2]}"
+    if [ "$tag_m" != "$wix_m" ] || [ "$tag_n" != "$wix_n" ]; then
+        err "Pushed tag '$tag' (${tag_m}.${tag_n}) does not match BHoM_Installer.wixproj MajorVersion.MinorVersion (${wix_m}.${wix_n}). Either bump the wixproj before pushing, or push a v${wix_m}.${wix_n}.x tag."
+        return 2
+    fi
+
+    printf '%s\n' "$tag"
+}
+
 resolve_main() {
     err "resolve_main not yet implemented"
     return 3
@@ -219,6 +239,25 @@ EOF
         gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags" --paginate \
             --jq '.[].ref | sub("^refs/tags/"; "")'
     }
+
+    # ── validate_release_tag ──
+    # Pushed tag must be v{M}.{N}.{P} (no pre-release suffix), where {M}.{N}
+    # matches wixproj. Errors otherwise.
+
+    assert_equal "release tag happy v9.2.0" "ok" \
+        "$(validate_release_tag "v9.2.0" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "release tag happy v9.2.5 patch" "ok" \
+        "$(validate_release_tag "v9.2.5" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "release tag rejects pre-release suffix" "fail" \
+        "$(validate_release_tag "v9.2.0-rc.1" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "release tag rejects M.N mismatch" "fail" \
+        "$(validate_release_tag "v9.3.0" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "release tag rejects malformed" "fail" \
+        "$(validate_release_tag "v9.2" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
 
     echo
     echo "Results: $pass passed, $fail failed"
