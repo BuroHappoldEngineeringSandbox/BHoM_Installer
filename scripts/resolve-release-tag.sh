@@ -45,6 +45,23 @@ lookup_releases() {
 
 # ─── core logic (filled in by subsequent tasks) ─────────────────────────────
 
+# Print "MAJOR MINOR" extracted from the wixproj file. Errors to stderr on
+# missing/invalid input.
+read_wixproj_version() {
+    local file="$1"
+    [ -f "$file" ] || { err "wixproj file not found: $file"; return 3; }
+
+    local major minor
+    major=$(grep -oE '<MajorVersion[^>]*>[0-9]+</MajorVersion>' "$file" \
+            | grep -oE '>[0-9]+<' | tr -d '><' | head -n1)
+    minor=$(grep -oE '<MinorVersion[^>]*>[0-9]+</MinorVersion>' "$file" \
+            | grep -oE '>[0-9]+<' | tr -d '><' | head -n1)
+
+    [ -n "$major" ] || { err "MajorVersion not found in $file"; return 3; }
+    [ -n "$minor" ] || { err "MinorVersion not found in $file"; return 3; }
+    printf '%s %s\n' "$major" "$minor"
+}
+
 resolve_main() {
     err "resolve_main not yet implemented"
     return 3
@@ -69,8 +86,40 @@ self_test() {
         fi
     }
 
-    # Placeholder failing case — replaced in subsequent tasks.
-    assert_equal "placeholder" "expected" "actual"
+    # ── read_wixproj_version ──
+    local tmp; tmp=$(mktemp)
+
+    cat > "$tmp" <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <PropertyGroup>
+    <MajorVersion Condition=" '$(MajorVersion)' == '' ">9</MajorVersion>
+    <MinorVersion Condition=" '$(MinorVersion)' == '' ">2</MinorVersion>
+  </PropertyGroup>
+</Project>
+EOF
+    assert_equal "wixproj happy path" "9 2" "$(read_wixproj_version "$tmp")"
+
+    cat > "$tmp" <<'EOF'
+<Project>
+  <PropertyGroup>
+    <MajorVersion>10</MajorVersion>
+    <MinorVersion>14</MinorVersion>
+  </PropertyGroup>
+</Project>
+EOF
+    assert_equal "wixproj no-condition double-digit" "10 14" "$(read_wixproj_version "$tmp")"
+
+    cat > "$tmp" <<'EOF'
+<Project><PropertyGroup><MajorVersion>9</MajorVersion></PropertyGroup></Project>
+EOF
+    local out; out=$(read_wixproj_version "$tmp" 2>&1 || true)
+    case "$out" in
+        *"MinorVersion not found"*) assert_equal "wixproj missing minor errors" "ok" "ok" ;;
+        *) assert_equal "wixproj missing minor errors" "ok" "got: $out" ;;
+    esac
+
+    rm -f "$tmp"
 
     echo
     echo "Results: $pass passed, $fail failed"
