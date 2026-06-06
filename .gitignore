@@ -266,3 +266,7 @@ Build/
 InstallerCore/Upgrades
 Extensions/
 InstallerCore/Resources/
+
+# Local working notes — not part of the project history
+docs/superpowers/
+docs/session-notes/
