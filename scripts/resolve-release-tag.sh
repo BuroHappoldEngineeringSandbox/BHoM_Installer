@@ -131,6 +131,27 @@ validate_release_tag() {
     printf '%s\n' "$tag"
 }
 
+# Conflict rule 3: a pre-release build is being attempted while a release
+# for v{wix_m}.{wix_n}.0 has already shipped. Bump wixproj or quit.
+assert_no_shipped_release_for() {
+    local wix_m="$1" wix_n="$2"
+    local target="v${wix_m}.${wix_n}.0"
+    if lookup_releases | grep -Fxq "$target"; then
+        err "Wixproj MajorVersion.MinorVersion (${wix_m}.${wix_n}) maps to ${target} which has already been released. Bump MajorVersion or MinorVersion in BHoM_Installer.wixproj before publishing further pre-releases."
+        return 2
+    fi
+}
+
+# Conflict rule 4: the pushed tag has already been published as a release.
+# softprops/action-gh-release would fail later; surface it now.
+assert_release_not_already_published() {
+    local tag="$1"
+    if lookup_releases | grep -Fxq "$tag"; then
+        err "${tag} has already been released. To re-release, delete the existing release in the GitHub UI first; to ship a follow-up, push a new tag (e.g. the next patch)."
+        return 2
+    fi
+}
+
 resolve_main() {
     err "resolve_main not yet implemented"
     return 3
@@ -258,6 +279,34 @@ EOF
 
     assert_equal "release tag rejects malformed" "fail" \
         "$(validate_release_tag "v9.2" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    # ── assert_no_shipped_release_for + assert_release_not_already_published ──
+
+    lookup_releases() { :; }
+    assert_equal "no released v9.2.0 - pre-releases ok" "ok" \
+        "$(assert_no_shipped_release_for 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    lookup_releases() { printf '%s\n' "v9.2.0"; }
+    assert_equal "v9.2.0 already shipped blocks pre-release" "fail" \
+        "$(assert_no_shipped_release_for 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    lookup_releases() { printf '%s\n' "v9.1.0" "v9.2.0-alpha.260601"; }
+    assert_equal "v9.2.0-alpha published does not block more alphas" "ok" \
+        "$(assert_no_shipped_release_for 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    lookup_releases() { :; }
+    assert_equal "rule 4: tag not yet released ok" "ok" \
+        "$(assert_release_not_already_published "v9.2.0" >/dev/null 2>&1 && echo ok || echo fail)"
+
+    lookup_releases() { printf '%s\n' "v9.2.0"; }
+    assert_equal "rule 4: tag already released blocks push" "fail" \
+        "$(assert_release_not_already_published "v9.2.0" >/dev/null 2>&1 && echo ok || echo fail)"
+
+    unset -f lookup_releases
+    lookup_releases() {
+        gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '.[].tag_name'
+    }
 
     echo
     echo "Results: $pass passed, $fail failed"
