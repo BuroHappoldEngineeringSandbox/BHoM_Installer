@@ -91,6 +91,26 @@ compute_alpha_tag() {
     printf '%s.%d\n' "$prefix" "$((max + 1))"
 }
 
+# Compute the beta-pre-release tag for a given Major, Minor.
+# Tag format: vM.N.0-beta.counter where counter is monotonic per (M,N,0).
+compute_beta_tag() {
+    local m="$1" n="$2"
+    local prefix="v${m}.${n}.0-beta"
+    local existing
+    existing=$(lookup_tags | grep -E "^${prefix}\\.[0-9]+\$" || true)
+
+    local max=0
+    while IFS= read -r tag; do
+        [ -z "$tag" ] && continue
+        local suffix="${tag#${prefix}.}"
+        if [[ "$suffix" =~ ^[0-9]+$ ]] && [ "$suffix" -gt "$max" ]; then
+            max="$suffix"
+        fi
+    done <<< "$existing"
+
+    printf '%s.%d\n' "$prefix" "$((max + 1))"
+}
+
 resolve_main() {
     err "resolve_main not yet implemented"
     return 3
@@ -172,6 +192,28 @@ EOF
         "v9.2.0-alpha.260605" "$(compute_alpha_tag 9 2 260605)"
 
     # Restore the real lookup_tags for any later tests.
+    unset -f lookup_tags
+    lookup_tags() {
+        gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags" --paginate \
+            --jq '.[].ref | sub("^refs/tags/"; "")'
+    }
+
+    # ── compute_beta_tag ──
+    # Tag format: vM.N.0-beta.counter, counter starts at 1.
+
+    lookup_tags() { :; }
+    assert_equal "beta first" "v9.2.0-beta.1" "$(compute_beta_tag 9 2)"
+
+    lookup_tags() { printf '%s\n' "v9.2.0-beta.1"; }
+    assert_equal "beta second" "v9.2.0-beta.2" "$(compute_beta_tag 9 2)"
+
+    lookup_tags() { printf '%s\n' "v9.2.0-beta.1" "v9.2.0-beta.2" "v9.2.0-beta.5"; }
+    assert_equal "beta after gap" "v9.2.0-beta.6" "$(compute_beta_tag 9 2)"
+
+    # Alpha tags do not influence the beta counter.
+    lookup_tags() { printf '%s\n' "v9.2.0-alpha.260605" "v9.2.0-alpha.260605.2"; }
+    assert_equal "beta ignores alpha tags" "v9.2.0-beta.1" "$(compute_beta_tag 9 2)"
+
     unset -f lookup_tags
     lookup_tags() {
         gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags" --paginate \
