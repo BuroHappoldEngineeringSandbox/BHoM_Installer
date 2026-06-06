@@ -152,9 +152,87 @@ assert_release_not_already_published() {
     fi
 }
 
+# Top-level orchestrator. Reads workflow context from env, computes the
+# tag and outputs, runs conflict-prevention rules. Writes KEY=VALUE pairs
+# to stdout (intended to be appended to $GITHUB_OUTPUT).
 resolve_main() {
-    err "resolve_main not yet implemented"
-    return 3
+    local event="${GITHUB_EVENT_NAME:-}"
+    local ref="${GITHUB_REF_NAME:-}"
+    local in_type="${INPUT_RELEASE_TYPE:-}"
+    local in_branch="${INPUT_SOURCE_BRANCH:-}"
+
+    local wixproj="${WIXPROJ_PATH:-BHoM_Installer/BHoM_Installer.wixproj}"
+    local mn; mn=$(read_wixproj_version "$wixproj") || return 3
+    local wix_m wix_n; read -r wix_m wix_n <<< "$mn"
+
+    local today="${TODAY_OVERRIDE:-$(date -u +%y%m%d)}"
+
+    local release_type source_branch prerelease make_latest release_tag msi_patch_version=""
+
+    case "$event" in
+        schedule)
+            release_type=alpha
+            source_branch=develop
+            prerelease=true
+            make_latest=false
+            assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
+            release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
+            # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
+            ;;
+
+        workflow_dispatch)
+            release_type="${in_type:-alpha}"
+            case "$release_type" in
+                alpha)
+                    source_branch="${in_branch:-develop}"
+                    assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
+                    release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
+                    # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
+                    ;;
+                beta)
+                    # Beta dispatch always builds from develop regardless of input.
+                    source_branch=develop
+                    assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
+                    release_tag=$(compute_beta_tag "$wix_m" "$wix_n")
+                    # MSI PatchVersion = the beta counter (e.g. v9.2.0-beta.3 -> 3).
+                    msi_patch_version="${release_tag##*-beta.}"
+                    ;;
+                *)
+                    err "Unknown release_type '$release_type' (expected alpha or beta)"
+                    return 3
+                    ;;
+            esac
+            prerelease=true
+            make_latest=false
+            ;;
+
+        push)
+            release_type=beta
+            source_branch=main
+            prerelease=false
+            make_latest=true
+            release_tag=$(validate_release_tag "$ref" "$wix_m" "$wix_n") || return 2
+            assert_release_not_already_published "$release_tag" || return 2
+            # MSI PatchVersion = the patch component of the pushed tag.
+            if [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.([0-9]+)$ ]]; then
+                msi_patch_version="${BASH_REMATCH[1]}"
+            else
+                msi_patch_version=0
+            fi
+            ;;
+
+        *)
+            err "Unsupported event '$event'"
+            return 3
+            ;;
+    esac
+
+    printf 'release_type=%s\n'      "$release_type"
+    printf 'source_branch=%s\n'     "$source_branch"
+    printf 'prerelease=%s\n'        "$prerelease"
+    printf 'make_latest=%s\n'       "$make_latest"
+    printf 'release_tag=%s\n'       "$release_tag"
+    printf 'msi_patch_version=%s\n' "$msi_patch_version"
 }
 
 err() { printf '::error::%s\n' "$*" >&2; }
@@ -307,6 +385,112 @@ EOF
         gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
             --jq '.[].tag_name'
     }
+
+    # ── resolve_main integration ──
+    # Drive resolve_main via env vars and capture stdout. Override
+    # lookup_tags/lookup_releases per case.
+
+    local wixproj_tmp; wixproj_tmp=$(mktemp)
+    cat > "$wixproj_tmp" <<'EOF'
+<Project><PropertyGroup>
+  <MajorVersion>9</MajorVersion>
+  <MinorVersion>2</MinorVersion>
+</PropertyGroup></Project>
+EOF
+    export WIXPROJ_PATH="$wixproj_tmp"
+    export TODAY_OVERRIDE="260605"
+
+    # Schedule -> alpha pre-release for today.
+    export GITHUB_EVENT_NAME=schedule GITHUB_REF_NAME=develop \
+        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    local out; out=$(lookup_tags()    { :; }; \
+                     lookup_releases(){ :; }; \
+                     resolve_main 2>/dev/null)
+    assert_equal "schedule -> release_type=alpha"     "alpha"                "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
+    assert_equal "schedule -> source_branch=develop"  "develop"              "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
+    assert_equal "schedule -> prerelease=true"        "true"                 "$(echo "$out" | grep '^prerelease='    | cut -d= -f2)"
+    assert_equal "schedule -> make_latest=false"      "false"                "$(echo "$out" | grep '^make_latest='   | cut -d= -f2)"
+    assert_equal "schedule -> release_tag computed"   "v9.2.0-alpha.260605"  "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
+
+    # workflow_dispatch beta -> beta-pre-release.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
+        INPUT_RELEASE_TYPE=beta INPUT_SOURCE_BRANCH=feature/test
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "dispatch beta -> release_type=beta"      "beta"            "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
+    assert_equal "dispatch beta -> source_branch=develop"  "develop"         "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
+    assert_equal "dispatch beta -> tag=v9.2.0-beta.1"      "v9.2.0-beta.1"   "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
+
+    # workflow_dispatch alpha with source_branch.
+    export GITHUB_EVENT_NAME=workflow_dispatch \
+        INPUT_RELEASE_TYPE=alpha INPUT_SOURCE_BRANCH=feature/foo
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "dispatch alpha source_branch passes through" "feature/foo" \
+        "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
+
+    # push v9.2.0 -> release.
+    export GITHUB_EVENT_NAME=push GITHUB_REF_NAME=v9.2.0 \
+        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "push v9.2.0 -> release_type=beta"   "beta"     "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
+    assert_equal "push v9.2.0 -> prerelease=false"    "false"    "$(echo "$out" | grep '^prerelease='    | cut -d= -f2)"
+    assert_equal "push v9.2.0 -> make_latest=true"    "true"     "$(echo "$out" | grep '^make_latest='   | cut -d= -f2)"
+    assert_equal "push v9.2.0 -> tag=v9.2.0"          "v9.2.0"   "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
+    assert_equal "push v9.2.0 -> msi_patch=0"         "0"        "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
+
+    # push v9.2.5 -> patch carried through.
+    export GITHUB_EVENT_NAME=push GITHUB_REF_NAME=v9.2.5
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "push v9.2.5 -> msi_patch=5"         "5"        "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
+
+    # workflow_dispatch beta -> msi_patch equals the counter.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
+        INPUT_RELEASE_TYPE=beta INPUT_SOURCE_BRANCH=""
+    out=$(lookup_tags()    { printf '%s\n' "v9.2.0-beta.1" "v9.2.0-beta.2"; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "beta dispatch -> msi_patch=3 (next counter)" "3" \
+        "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
+
+    # workflow_dispatch alpha -> msi_patch empty (Build-Installer.ps1 defaults to yyMMdd).
+    export GITHUB_EVENT_NAME=workflow_dispatch INPUT_RELEASE_TYPE=alpha
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "alpha dispatch -> msi_patch empty" "" \
+        "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
+
+    # push v9.2.0 when already-published -> rule 4 fires.
+    export GITHUB_EVENT_NAME=push GITHUB_REF_NAME=v9.2.0 \
+        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
+          resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$out" in
+        *"already been released"*"exit=2") assert_equal "rule 4 trips on push of published tag" "ok" "ok" ;;
+        *) assert_equal "rule 4 trips on push of published tag" "ok" "got: $out" ;;
+    esac
+
+    # schedule when v9.2.0 already shipped -> rule 3 fires.
+    export GITHUB_EVENT_NAME=schedule GITHUB_REF_NAME=develop \
+        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
+          resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$out" in
+        *"already been released"*"exit=2") assert_equal "rule 3 trips on alpha when v9.2.0 shipped" "ok" "ok" ;;
+        *) assert_equal "rule 3 trips on alpha when v9.2.0 shipped" "ok" "got: $out" ;;
+    esac
+
+    rm -f "$wixproj_tmp"
+    unset WIXPROJ_PATH TODAY_OVERRIDE GITHUB_EVENT_NAME GITHUB_REF_NAME INPUT_RELEASE_TYPE INPUT_SOURCE_BRANCH
 
     echo
     echo "Results: $pass passed, $fail failed"
