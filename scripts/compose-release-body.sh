@@ -18,6 +18,7 @@
 # appear automatically without further changes here.
 #
 # Required environment:
+#   BUILT_AT             ISO8601 UTC timestamp from dep-manifest.json's built_at field.
 #   GITHUB_SERVER_URL    Provided by GitHub Actions.
 #   GITHUB_REPOSITORY    Provided by GitHub Actions.
 #   GITHUB_RUN_ID        Provided by GitHub Actions.
@@ -90,6 +91,7 @@ ${intro}
 | Field | Value |
 |---|---|
 | Build | [#${GITHUB_RUN_ID}]($run_url) |
+| Built at | \`${BUILT_AT}\` |
 | Commit | \`${GITHUB_SHA}\` |
 | Triggered by | \`${GITHUB_EVENT_NAME}\` |
 

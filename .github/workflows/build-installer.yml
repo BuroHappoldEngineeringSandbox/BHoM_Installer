@@ -525,12 +525,21 @@ jobs:
               "${{ steps.prev-manifest.outputs.path }}" \
               release-notes-section.md
 
+      - name: Extract built_at from dep-manifest
+        id: built-at
+        run: |
+          set -eu
+          built_at=$(jq -r '.built_at' artefact/dep-manifest.json)
+          [ -n "$built_at" ] && [ "$built_at" != "null" ] || { echo "::error::built_at missing from dep-manifest.json"; exit 1; }
+          echo "value=$built_at" >> "$GITHUB_OUTPUT"
+
       - name: Compose full release body
         env:
           GH_TOKEN:      ${{ github.token }}
           PREV_TAG:      ${{ steps.prev-manifest.outputs.prev_tag }}
           RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
           IS_PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+          BUILT_AT:      ${{ steps.built-at.outputs.value }}
         run: bash scripts/compose-release-body.sh
 
       - name: Publish release
