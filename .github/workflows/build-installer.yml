@@ -55,81 +55,33 @@ jobs:
     name: Resolve release parameters
     runs-on: ubuntu-latest
     outputs:
-      release_type:  ${{ steps.r.outputs.release_type }}
-      patch_version: ${{ steps.r.outputs.patch_version }}
-      main_branch:   ${{ steps.r.outputs.main_branch }}
-      prerelease:    ${{ steps.r.outputs.prerelease }}
-      make_latest:   ${{ steps.r.outputs.make_latest }}
-      release_tag:   ${{ steps.r.outputs.release_tag }}
+      release_type:      ${{ steps.r.outputs.release_type }}
+      source_branch:     ${{ steps.r.outputs.source_branch }}
+      prerelease:        ${{ steps.r.outputs.prerelease }}
+      make_latest:       ${{ steps.r.outputs.make_latest }}
+      release_tag:       ${{ steps.r.outputs.release_tag }}
+      msi_patch_version: ${{ steps.r.outputs.msi_patch_version }}
     steps:
+      - name: Checkout (sparse) for the wixproj and resolve script
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            BHoM_Installer/BHoM_Installer.wixproj
+            scripts/resolve-release-tag.sh
+          sparse-checkout-cone-mode: false
+
       - id: r
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_RELEASE_TYPE:  ${{ inputs.release_type }}
-          INPUT_PATCH_VERSION: ${{ inputs.patch_version }}
+          INPUT_SOURCE_BRANCH: ${{ inputs.source_branch }}
         run: |
-          set -eu
-
-          case "$GITHUB_EVENT_NAME" in
-            schedule)
-              release_type=alpha
-              patch_version=""        # Build-Installer.ps1 defaults to today (YYMMDD)
-              main_branch=develop
-              prerelease=true
-              make_latest=false
-              release_tag=""          # publish step composes 'alpha-{YYYYMMDD-HHMMSS}'
-              ;;
-
-            workflow_dispatch)
-              release_type="${INPUT_RELEASE_TYPE:-alpha}"
-              patch_version="$INPUT_PATCH_VERSION"
-              main_branch=develop     # dispatch builds always track develop tip
-              prerelease=true
-              make_latest=false
-              release_tag=""          # publish step composes a timestamped tag
-              ;;
-
-            push)
-              # Tag push 'v*'. Tag schema mirrors BHoMBot's beta convention:
-              # v{major}.{minor}.{patch} where patch defaults to 0 and is the
-              # hotfix counter within the major.minor milestone.
-              release_type=beta
-              main_branch=main        # deps build against main, matching the tag
-              prerelease=false
-              make_latest=true
-              release_tag="$GITHUB_REF_NAME"
-
-              # Extract the patch component from the tag. Expected forms
-              # (any non-numeric suffix is ignored so semver pre-release
-              # identifiers and ad-hoc test suffixes both parse cleanly):
-              #   v9.2          -> patch 0
-              #   v9.2.0        -> patch 0
-              #   v9.2.1        -> patch 1
-              #   v9.2.0-rc.1   -> patch 0
-              #   v9.2.0-test   -> patch 0
-              ver="${GITHUB_REF_NAME#v}"
-              if [[ "$ver" =~ ^[0-9]+\.[0-9]+(\.([0-9]+))? ]]; then
-                  patch_version="${BASH_REMATCH[2]:-0}"
-              else
-                  echo "::warning::Tag '$GITHUB_REF_NAME' does not match v{major}.{minor}[.{patch}]; using patch_version=0"
-                  patch_version=0
-              fi
-              ;;
-
-            *)
-              echo "::error::Unsupported event '$GITHUB_EVENT_NAME'"
-              exit 1
-              ;;
-          esac
-
-          echo "release_type=$release_type"   >> "$GITHUB_OUTPUT"
-          echo "patch_version=$patch_version" >> "$GITHUB_OUTPUT"
-          echo "main_branch=$main_branch"     >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease"       >> "$GITHUB_OUTPUT"
-          echo "make_latest=$make_latest"     >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag"     >> "$GITHUB_OUTPUT"
-
-          echo "::notice::release_type=$release_type, patch_version='$patch_version', main_branch=$main_branch, prerelease=$prerelease, release_tag='$release_tag'"
+          set -euo pipefail
+          bash scripts/resolve-release-tag.sh >> "$GITHUB_OUTPUT"
+          echo "::notice::Resolved parameters:"
+          grep -E '^(release_type|source_branch|prerelease|make_latest|release_tag|msi_patch_version)=' "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ needs.resolve.outputs.release_type }} installer
@@ -229,17 +181,17 @@ jobs:
       - name: Build installer
         id: build
         env:
-          RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
-          PATCH_VERSION: ${{ needs.resolve.outputs.patch_version }}
-          MAIN_BRANCH:   ${{ needs.resolve.outputs.main_branch }}
+          RELEASE_TYPE:      ${{ needs.resolve.outputs.release_type }}
+          MSI_PATCH_VERSION: ${{ needs.resolve.outputs.msi_patch_version }}
+          SOURCE_BRANCH:     ${{ needs.resolve.outputs.source_branch }}
         run: |
           # Hashtable splat (not array) so PowerShell binds by parameter name.
           # Array splatting would otherwise treat '-ReleaseType' as a value.
           $splat = @{
               ReleaseType = $env:RELEASE_TYPE
-              MainBranch  = $env:MAIN_BRANCH
+              MainBranch  = $env:SOURCE_BRANCH
           }
-          if ($env:PATCH_VERSION) { $splat['PatchVersion'] = $env:PATCH_VERSION }
+          if ($env:MSI_PATCH_VERSION) { $splat['PatchVersion'] = $env:MSI_PATCH_VERSION }
 
           & "$env:GITHUB_WORKSPACE\scripts\Build-Installer.ps1" @splat
 
@@ -251,7 +203,7 @@ jobs:
         # release notes.
         env:
           RELEASE_TYPE: ${{ needs.resolve.outputs.release_type }}
-          MAIN_BRANCH:  ${{ needs.resolve.outputs.main_branch }}
+          SOURCE_BRANCH:  ${{ needs.resolve.outputs.source_branch }}
         run: |
           $depsObject = [ordered]@{}
           Get-ChildItem 'D:\a\BHoM_Installer' -Directory -ErrorAction SilentlyContinue |
@@ -263,7 +215,7 @@ jobs:
                       $orgRepo = "$($Matches[1])/$($Matches[2])"
                       $sha = (git -C $_.FullName rev-parse HEAD 2>$null).Trim()
                       if ($sha) {
-                          $depsObject[$orgRepo] = [ordered]@{ branch = $env:MAIN_BRANCH; sha = $sha }
+                          $depsObject[$orgRepo] = [ordered]@{ branch = $env:SOURCE_BRANCH; sha = $sha }
                       }
                   }
               }
@@ -272,7 +224,7 @@ jobs:
               version       = 1
               built_at      = (Get-Date).ToUniversalTime().ToString('o')
               release_type  = $env:RELEASE_TYPE
-              main_branch   = $env:MAIN_BRANCH
+              source_branch = $env:SOURCE_BRANCH
               deps          = $depsObject
           }
 
