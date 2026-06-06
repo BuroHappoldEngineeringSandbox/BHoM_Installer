@@ -52,6 +52,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-installer-${{ github.event_name }}
+  cancel-in-progress: false
+
 jobs:
   # Normalise the trigger event into the parameters every downstream job
   # needs. Single source of truth for: which release type to build, what
