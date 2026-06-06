@@ -197,6 +197,10 @@ jobs:
               ReleaseType = $env:RELEASE_TYPE
               MainBranch  = $env:SOURCE_BRANCH
           }
+          # Only forward MSI_PATCH_VERSION when resolve emitted one. Alpha
+          # leaves it blank so Build-Installer.ps1 falls through to its yyMMdd
+          # default (line 68-70). Beta-pre-release and beta-release flavours
+          # set it explicitly so the MSI filename matches the release tag.
           if ($env:MSI_PATCH_VERSION) { $splat['PatchVersion'] = $env:MSI_PATCH_VERSION }
 
           & "$env:GITHUB_WORKSPACE\scripts\Build-Installer.ps1" @splat
