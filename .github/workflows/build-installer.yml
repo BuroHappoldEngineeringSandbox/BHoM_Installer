@@ -449,6 +449,7 @@ jobs:
         with:
           fetch-depth: 1
           sparse-checkout: |
+            scripts/find-previous-release.sh
             scripts/generate_release_notes.py
             scripts/compose-release-body.sh
           sparse-checkout-cone-mode: false
