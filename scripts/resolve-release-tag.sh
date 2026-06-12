@@ -6,18 +6,17 @@
 # KEY=VALUE pairs to stdout (intended to be appended to $GITHUB_OUTPUT).
 #
 # Inputs (env):
-#   GITHUB_EVENT_NAME    'schedule' | 'workflow_dispatch' | 'push'
-#   GITHUB_REF_NAME      For 'push': the pushed tag (e.g. 'v9.2.0').
+#   GITHUB_EVENT_NAME    'schedule' | 'workflow_dispatch'
 #   GITHUB_REPOSITORY    'owner/repo' for the gh API calls.
-#   INPUT_RELEASE_TYPE   'alpha' | 'rc' on workflow_dispatch; empty otherwise.
+#   INPUT_RELEASE_TYPE   'alpha' | 'rc' | 'final' on workflow_dispatch; empty otherwise.
 #   INPUT_SOURCE_BRANCH  Branch to build from on alpha dispatch; default 'develop'.
 #   GH_TOKEN             For gh api calls. Workflow's github.token is sufficient.
 #
 # Outputs (stdout):
-#   release_type=<alpha|rc|beta>
+#   release_type=<alpha|rc|final>
 #                <alpha> for schedule and alpha dispatch
 #                <rc>    for rc dispatch
-#                <beta>  for tag-push (final release)
+#                <final> for final dispatch
 #   source_branch=<branch>
 #   prerelease=<true|false>
 #   make_latest=<true|false>
@@ -114,24 +113,11 @@ compute_rc_tag() {
     printf '%s.%d\n' "$prefix" "$((max + 1))"
 }
 
-# Validate that a pushed tag is of form v{M}.{N}.{P} (no pre-release suffix)
-# and that its M.N matches the wixproj. Exits non-zero with an ::error:: on
-# failure; prints the tag on success.
-validate_release_tag() {
-    local tag="$1" wix_m="$2" wix_n="$3"
-
-    if ! [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-        err "Pushed tag '$tag' is not of form v{major}.{minor}.{patch} with no pre-release suffix. Final release tags only — push pre-release builds via workflow_dispatch instead."
-        return 2
-    fi
-
-    local tag_m="${BASH_REMATCH[1]}" tag_n="${BASH_REMATCH[2]}"
-    if [ "$tag_m" != "$wix_m" ] || [ "$tag_n" != "$wix_n" ]; then
-        err "Pushed tag '$tag' (${tag_m}.${tag_n}) does not match BHoM_Installer.wixproj MajorVersion.MinorVersion (${wix_m}.${wix_n}). Either bump the wixproj before pushing, or push a v${wix_m}.${wix_n}.x tag."
-        return 2
-    fi
-
-    printf '%s\n' "$tag"
+# Derive the final release tag from the wixproj MajorVersion.MinorVersion.
+# Patch component is always 0 under the no-patches model (proposal Section 4.4).
+derive_final_tag() {
+    local wix_m="$1" wix_n="$2"
+    printf 'v%s.%s.0\n' "$wix_m" "$wix_n"
 }
 
 # Conflict rule 3: a pre-release build is being attempted while a release
@@ -155,15 +141,28 @@ assert_release_not_already_published() {
     fi
 }
 
-# Conflict rule 6: RC dispatches must build from develop. The silent
-# override in earlier versions was a UX bug. The user's source_branch input
-# was discarded with no signal. Fail fast instead so the user notices.
-assert_rc_source_branch_is_develop() {
-    local in_branch="$1"
-    if [ -n "$in_branch" ] && [ "$in_branch" != "develop" ]; then
-        err "RC dispatches must build from develop. Got source_branch='$in_branch'. Re-dispatch with source_branch=develop (or leave it empty), or use release_type=alpha to build from '$in_branch'."
-        return 2
-    fi
+# Conflict rule 6: source branch must match the release type semantics.
+#   rc    -> develop (release-candidate of a milestone in progress)
+#   final -> main    (post develop->main merge; the released line)
+# alpha allows any source branch (the input is the dispatch flag itself, no
+# semantic constraint). Fail fast on mismatch instead of silently overriding
+# the user's input.
+assert_source_branch_matches_release_type() {
+    local release_type="$1" in_branch="$2"
+    case "$release_type" in
+        rc)
+            if [ -n "$in_branch" ] && [ "$in_branch" != "develop" ]; then
+                err "RC dispatches must build from develop. Got source_branch='$in_branch'. Re-dispatch with source_branch=develop (or leave it empty), or use release_type=alpha to build from '$in_branch'."
+                return 2
+            fi
+            ;;
+        final)
+            if [ -n "$in_branch" ] && [ "$in_branch" != "main" ]; then
+                err "Final dispatches must build from main. Got source_branch='$in_branch'. Merge develop->main first, then re-dispatch with source_branch=main (or leave it empty)."
+                return 2
+            fi
+            ;;
+    esac
 }
 
 # Top-level orchestrator. Reads workflow context from env, computes the
@@ -202,42 +201,40 @@ resolve_main() {
                     assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
                     release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
                     # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
+                    prerelease=true
+                    make_latest=false
                     ;;
                 rc)
-                    assert_rc_source_branch_is_develop "$in_branch" || return 2
+                    assert_source_branch_matches_release_type rc "$in_branch" || return 2
                     # RC dispatch always builds from develop regardless of input.
                     source_branch=develop
                     assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
                     release_tag=$(compute_rc_tag "$wix_m" "$wix_n")
                     # MSI PatchVersion = the RC counter (e.g. v9.2.0-rc.3 -> 3).
                     msi_patch_version="${release_tag##*-rc.}"
+                    prerelease=true
+                    make_latest=false
+                    ;;
+                final)
+                    assert_source_branch_matches_release_type final "$in_branch" || return 2
+                    # Final dispatch always builds from main regardless of input.
+                    source_branch=main
+                    release_tag=$(derive_final_tag "$wix_m" "$wix_n")
+                    assert_release_not_already_published "$release_tag" || return 2
+                    # MSI PatchVersion = 0 under the no-patches model.
+                    msi_patch_version=0
+                    prerelease=false
+                    make_latest=true
                     ;;
                 *)
-                    err "Unknown release_type '$release_type' (expected alpha or rc)"
+                    err "Unknown release_type '$release_type' (expected alpha, rc, or final)"
                     return 3
                     ;;
             esac
-            prerelease=true
-            make_latest=false
-            ;;
-
-        push)
-            release_type=beta
-            source_branch=main
-            prerelease=false
-            make_latest=true
-            release_tag=$(validate_release_tag "$ref" "$wix_m" "$wix_n") || return 2
-            assert_release_not_already_published "$release_tag" || return 2
-            # MSI PatchVersion = the patch component of the pushed tag.
-            if [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.([0-9]+)$ ]]; then
-                msi_patch_version="${BASH_REMATCH[1]}"
-            else
-                msi_patch_version=0
-            fi
             ;;
 
         *)
-            err "Unsupported event '$event'"
+            err "Unsupported event '$event' (expected schedule or workflow_dispatch)"
             return 3
             ;;
     esac
@@ -354,24 +351,12 @@ EOF
             --jq '.[].ref | sub("^refs/tags/"; "")'
     }
 
-    # ── validate_release_tag ──
-    # Pushed tag must be v{M}.{N}.{P} (no pre-release suffix), where {M}.{N}
-    # matches wixproj. Errors otherwise.
+    # ── derive_final_tag ──
+    # Final tag is always vM.N.0 derived from the wixproj.
 
-    assert_equal "release tag happy v9.2.0" "ok" \
-        "$(validate_release_tag "v9.2.0" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
-
-    assert_equal "release tag happy v9.2.5 patch" "ok" \
-        "$(validate_release_tag "v9.2.5" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
-
-    assert_equal "release tag rejects pre-release suffix" "fail" \
-        "$(validate_release_tag "v9.2.0-rc.1" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
-
-    assert_equal "release tag rejects M.N mismatch" "fail" \
-        "$(validate_release_tag "v9.3.0" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
-
-    assert_equal "release tag rejects malformed" "fail" \
-        "$(validate_release_tag "v9.2" 9 2 >/dev/null 2>&1 && echo ok || echo fail)"
+    assert_equal "final tag from wixproj 9.2"  "v9.2.0"  "$(derive_final_tag 9 2)"
+    assert_equal "final tag from wixproj 10.0" "v10.0.0" "$(derive_final_tag 10 0)"
+    assert_equal "final tag from wixproj 9.14" "v9.14.0" "$(derive_final_tag 9 14)"
 
     # ── assert_no_shipped_release_for + assert_release_not_already_published ──
 
@@ -446,24 +431,26 @@ EOF
     assert_equal "dispatch alpha source_branch passes through" "feature/foo" \
         "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
 
-    # push v9.2.0 -> release.
-    export GITHUB_EVENT_NAME=push GITHUB_REF_NAME=v9.2.0 \
-        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    # workflow_dispatch final -> final release.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=main \
+        INPUT_RELEASE_TYPE=final INPUT_SOURCE_BRANCH=main
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "push v9.2.0 -> release_type=beta"   "beta"     "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
-    assert_equal "push v9.2.0 -> prerelease=false"    "false"    "$(echo "$out" | grep '^prerelease='    | cut -d= -f2)"
-    assert_equal "push v9.2.0 -> make_latest=true"    "true"     "$(echo "$out" | grep '^make_latest='   | cut -d= -f2)"
-    assert_equal "push v9.2.0 -> tag=v9.2.0"          "v9.2.0"   "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
-    assert_equal "push v9.2.0 -> msi_patch=0"         "0"        "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
+    assert_equal "dispatch final -> release_type=final" "final"  "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
+    assert_equal "dispatch final -> source_branch=main" "main"   "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
+    assert_equal "dispatch final -> prerelease=false"   "false"  "$(echo "$out" | grep '^prerelease='    | cut -d= -f2)"
+    assert_equal "dispatch final -> make_latest=true"   "true"   "$(echo "$out" | grep '^make_latest='   | cut -d= -f2)"
+    assert_equal "dispatch final -> tag=v9.2.0"         "v9.2.0" "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
+    assert_equal "dispatch final -> msi_patch=0"        "0"      "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
-    # push v9.2.5 -> patch carried through.
-    export GITHUB_EVENT_NAME=push GITHUB_REF_NAME=v9.2.5
+    # workflow_dispatch final with empty source_branch -> succeeds (defaults to main).
+    export INPUT_SOURCE_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "push v9.2.5 -> msi_patch=5"         "5"        "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
+    assert_equal "dispatch final + empty source -> source=main" "main" \
+        "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
 
     # workflow_dispatch rc -> msi_patch equals the counter.
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
@@ -482,15 +469,36 @@ EOF
     assert_equal "alpha dispatch -> msi_patch empty" "" \
         "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
-    # push v9.2.0 when already-published -> rule 4 fires.
-    export GITHUB_EVENT_NAME=push GITHUB_REF_NAME=v9.2.0 \
-        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    # dispatch final when v9.2.0 already published -> rule 4 fires.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=main \
+        INPUT_RELEASE_TYPE=final INPUT_SOURCE_BRANCH=main
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"already been released"*"exit=2") assert_equal "rule 4 trips on push of published tag" "ok" "ok" ;;
-        *) assert_equal "rule 4 trips on push of published tag" "ok" "got: $out" ;;
+        *"already been released"*"exit=2") assert_equal "rule 4 trips on final dispatch when already published" "ok" "ok" ;;
+        *) assert_equal "rule 4 trips on final dispatch when already published" "ok" "got: $out" ;;
+    esac
+
+    # dispatch final from develop -> rule 6 fires.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=main \
+        INPUT_RELEASE_TYPE=final INPUT_SOURCE_BRANCH=develop
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$out" in
+        *"Final dispatches must build from main"*"exit=2") assert_equal "rule 6: final + develop fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: final + develop fails" "ok" "got: $out" ;;
+    esac
+
+    # dispatch final from feature branch -> rule 6 fires.
+    export INPUT_SOURCE_BRANCH=feature/X
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$out" in
+        *"Final dispatches must build from main"*"exit=2") assert_equal "rule 6: final + feature/X fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: final + feature/X fails" "ok" "got: $out" ;;
     esac
 
     # schedule when v9.2.0 already shipped -> rule 3 fires.

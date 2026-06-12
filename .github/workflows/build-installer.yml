@@ -6,14 +6,16 @@
 #   schedule            Nightly alpha. Fires 00:45 UTC on the default branch
 #                       only. release_type=alpha, prerelease=true.
 #
-#   workflow_dispatch   Manual run. The 'release_type' input chooses alpha or
-#                       rc; rc is intended for use during a feature-freeze
-#                       window. prerelease=true in both cases.
-#
-#   push: tags 'v*'     Finalised release. The tag (e.g. v9.2.0) is pushed to
-#                       the default branch after a develop -> main merge.
-#                       release_type=beta, prerelease=false, marked as the
-#                       Latest release on the Releases page.
+#   workflow_dispatch   Manual run. The 'release_type' input chooses:
+#                         alpha — pre-release from any branch (default develop).
+#                                 release_type=alpha, prerelease=true.
+#                         rc    — release candidate from develop (during freeze).
+#                                 release_type=rc, prerelease=true.
+#                         final — finalised release from main (post develop->main
+#                                 merge). release_type=final, prerelease=false,
+#                                 marked as Latest. The tag (vM.N.0 derived from
+#                                 BHoM_Installer.wixproj) is created by this
+#                                 workflow at the built commit; no manual push.
 
 name: Build Installer
 
@@ -23,14 +25,16 @@ on:
       release_type:
         description: |
           alpha — alpha pre-release. Tag: vM.N.0-alpha.YYMMDD[.counter]
-          rc    — release candidate (use during feature-freeze QA).
-                  Tag: vM.N.0-rc.counter
-          Final beta releases are produced ONLY by pushing a 'v*' git tag,
-          never via this dispatch.
+          rc    — release candidate (use during feature-freeze QA). Source must
+                  be develop. Tag: vM.N.0-rc.counter
+          final — finalised release. Source must be main (post develop->main
+                  merge). Tag: vM.N.0 derived from BHoM_Installer.wixproj.
+                  Marked Latest on the Releases page; prerelease=false.
         type: choice
         options:
           - alpha
           - rc
+          - final
         default: alpha
       source_branch:
         description: |
@@ -44,10 +48,6 @@ on:
 
   schedule:
     - cron: '45 0 * * *'   # 00:45 UTC nightly, matching BHoMBot
-
-  push:
-    tags:
-      - 'v*'
 
 permissions:
   contents: read
@@ -425,10 +425,14 @@ jobs:
   # Publish the .msi as a preserved per-build GitHub Release. The flavour
   # is determined by what triggered the run, normalised in the resolve job:
   #
-  #   schedule        alpha       prerelease=true   tag = alpha-{YYYYMMDD-HHMMSS}
-  #   dispatch alpha  alpha       prerelease=true   tag = alpha-{YYYYMMDD-HHMMSS}
-  #   dispatch rc     rc          prerelease=true   tag = rc-{YYYYMMDD-HHMMSS}
-  #   push v*         beta        prerelease=false  tag = the git tag (e.g. v9.2.0), marked Latest
+  #   schedule        alpha   prerelease=true   tag = vM.N.0-alpha.YYMMDD[.counter]
+  #   dispatch alpha  alpha   prerelease=true   tag = vM.N.0-alpha.YYMMDD[.counter]
+  #   dispatch rc     rc      prerelease=true   tag = vM.N.0-rc.N
+  #   dispatch final  final   prerelease=false  tag = vM.N.0, marked Latest
+  #
+  # softprops/action-gh-release creates the git tag at the workflow's commit
+  # if it does not already exist. For dispatched runs the tag is therefore
+  # created by the workflow rather than pushed by a human.
   #
   # Each release is preserved (no rolling tag, no overwrite). History
   # accumulates indefinitely. Gated on the entire pipeline succeeding
@@ -468,23 +472,16 @@ jobs:
           RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
         run: |
           set -eu
-          if [ -n "$RESOLVED_TAG" ]; then
-              # Tag-push event: reuse the git tag as the release tag.
-              tag="$RESOLVED_TAG"
-              name="BHoM ${RESOLVED_TAG} Release"
-          else
-              # Schedule or dispatch: compose a timestamped tag from the
-              # release type.
-              ts=$(date -u +%Y%m%d-%H%M%S)
-              tag="${RELEASE_TYPE}-${ts}"
-              case "$RELEASE_TYPE" in
-                  alpha) human="Alpha Installer" ;;
-                  rc)    human="Release Candidate Installer" ;;
-                  beta)  human="Beta Installer" ;;
-                  *)     human="${RELEASE_TYPE^} Installer" ;;
-              esac
-              name="BHoM ${human} ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)"
-          fi
+          # The resolve job always emits release_tag for every supported event
+          # (schedule / dispatch alpha / dispatch rc / dispatch final), so we
+          # reuse it directly. The release name varies by flavour.
+          tag="$RESOLVED_TAG"
+          case "$RELEASE_TYPE" in
+              final) name="BHoM ${tag} Release" ;;
+              rc)    name="BHoM ${tag} Release Candidate" ;;
+              alpha) name="BHoM ${tag} Alpha" ;;
+              *)     name="BHoM ${tag}" ;;
+          esac
           echo "tag=$tag"   >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "::notice::Release tag = $tag"
@@ -498,7 +495,16 @@ jobs:
 
       - name: Download anchor's dep-manifest
         id: prev-manifest
-        if: needs.resolve.outputs.source_branch == 'develop' && steps.anchor.outputs.anchor_kind == 'stable'
+        # Diff section renders for canonical-source builds only:
+        #   alpha / rc -> source_branch=develop
+        #   final      -> source_branch=main
+        # Non-canonical dispatches (typically alpha-from-feature-branch) skip
+        # the download; compose-release-body.sh renders a warning block instead.
+        if: |
+          steps.anchor.outputs.anchor_kind == 'stable' && (
+            needs.resolve.outputs.source_branch == 'develop' ||
+            (needs.resolve.outputs.source_branch == 'main' && needs.resolve.outputs.release_type == 'final')
+          )
         env:
           GH_TOKEN: ${{ github.token }}
           ANCHOR_TAG: ${{ steps.anchor.outputs.anchor_tag }}
@@ -517,7 +523,11 @@ jobs:
           fi
 
       - name: Generate dep-change release-notes section
-        if: needs.resolve.outputs.source_branch == 'develop' && steps.anchor.outputs.anchor_kind == 'stable' && steps.prev-manifest.outputs.path != ''
+        if: |
+          steps.anchor.outputs.anchor_kind == 'stable' && steps.prev-manifest.outputs.path != '' && (
+            needs.resolve.outputs.source_branch == 'develop' ||
+            (needs.resolve.outputs.source_branch == 'main' && needs.resolve.outputs.release_type == 'final')
+          )
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -556,18 +566,15 @@ jobs:
           make_latest: ${{ needs.resolve.outputs.make_latest }}
           prerelease:  ${{ needs.resolve.outputs.prerelease }}
 
-  # Open a GitHub Issue when a non-interactive build fails, so the breakage
-  # does not rot silently. Fires on:
-  #   schedule           Scheduled nightly. Nobody is watching at 00:45 UTC.
-  #   push (tag v*)      Release publish. A failed release tag is at least as
-  #                      important as a failed nightly; the release coordinator
-  #                      tagged and expects it to succeed.
-  # Does NOT fire on workflow_dispatch failures: the human who triggered the
-  # run is already watching the Actions tab.
+  # Open a GitHub Issue when an unattended build fails, so the breakage does
+  # not rot silently. Fires on:
+  #   schedule    Scheduled nightly. Nobody is watching at 00:45 UTC.
+  # Does NOT fire on workflow_dispatch failures (alpha, rc, or final) because
+  # the human who triggered the run is already watching the Actions tab.
   notify-on-failure:
-    name: Open issue on failed scheduled or tagged build
+    name: Open issue on failed nightly build
     needs: [build, install-test]
-    if: failure() && (github.event_name == 'schedule' || github.event_name == 'push')
+    if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       issues: write

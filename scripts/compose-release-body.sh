@@ -26,7 +26,7 @@
 #   GITHUB_RUN_ID        Provided by GitHub Actions.
 #   GITHUB_SHA           Provided by GitHub Actions.
 #   GH_TOKEN             Token with 'actions: read' on the repo.
-#   RELEASE_TYPE         'alpha' or 'beta'. Drives the intro sentence.
+#   RELEASE_TYPE         'alpha' | 'rc' | 'final'. Drives the intro sentence.
 #   IS_PRERELEASE        'true' or 'false'. Drives the intro sentence.
 #
 # Optional local file:
@@ -41,21 +41,32 @@ set -eu
 
 run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-# Decide whether this build is on the canonical lineage. Non-canonical means
-# the user dispatched with a non-develop source_branch. push events (final
-# releases) always use main, but that is the canonical final-release path;
-# only workflow_dispatch with non-develop is treated as non-canonical.
+# Decide whether this build is on the canonical lineage. Canonical sources:
+#   alpha / rc  -> develop
+#   final       -> main
+# Anything else is a non-canonical dispatch (typically alpha from a feature
+# branch), which renders a warning block instead of the diff section.
+case "${RELEASE_TYPE}" in
+    final)   canonical_source="main" ;;
+    *)       canonical_source="develop" ;;
+esac
 is_non_canonical="false"
-if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${SOURCE_BRANCH}" != "develop" ]; then
+if [ "${SOURCE_BRANCH}" != "${canonical_source}" ]; then
     is_non_canonical="true"
 fi
 
 # Intro sentence varies by flavour.
-if [ "$IS_PRERELEASE" = "true" ]; then
-    intro="Pre-release ${RELEASE_TYPE} build of the BHoM installer produced by the CI pipeline. See the build provenance below before installing."
-else
-    intro="Release build of the BHoM installer produced by the CI pipeline from a tagged commit on main."
-fi
+case "${RELEASE_TYPE}" in
+    final)
+        intro="Release build of the BHoM installer produced by the CI pipeline from main."
+        ;;
+    rc)
+        intro="Release candidate build of the BHoM installer produced by the CI pipeline from develop during a freeze window. See the build provenance below before installing."
+        ;;
+    *)
+        intro="Pre-release ${RELEASE_TYPE} build of the BHoM installer produced by the CI pipeline. See the build provenance below before installing."
+        ;;
+esac
 
 # Optional "Source branch" provenance row, only when non-canonical.
 source_branch_row=""
