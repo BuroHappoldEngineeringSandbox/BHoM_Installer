@@ -274,6 +274,94 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # ─── Nightly full-history versioning (fail-soft) ─────────────────────
+      #
+      # Mirrors BHoMBot's BotModules/Testing/Compute/RunVersioning.cs which
+      # sends "full" to the VersioningProcess pipe at 03:00 UTC nightly,
+      # invoking BH.Test.Versioning.Verify.FromJsonDatasets with test_all=true.
+      # In BHoMBot's model, results land in a database table; here they land
+      # in a 30-day uploaded artefact, surfaced via a `::warning::` annotation
+      # on the workflow run when a regression is detected.
+      #
+      # The alpha build above leaves the full ecosystem staged at
+      # C:\ProgramData\BHoM\Assemblies (alpha+beta-tier). We piggy-back on
+      # that: build Verification.sln to stage historical datasets +
+      # Versioning_Test.dll, then invoke VersioningRunner with --test-all.
+      #
+      # Fail-soft: continue-on-error on the runner invocation so a regression
+      # does NOT fail the nightly. The per-PR Versioning check (test_all=false)
+      # is the gating signal; this scheduled run is the catch-everything
+      # safety net. Per-PR is fast and author-attributable; this is slow and
+      # ecosystem-wide.
+      #
+      # Gated to scheduled events only — dispatched alpha/rc/final runs do
+      # not pay the cost.
+
+      - name: Build Verification.sln (nightly full-history)
+        if: github.event_name == 'schedule'
+        shell: pwsh
+        run: |
+          $codeLocation = Split-Path -Parent $env:GITHUB_WORKSPACE
+          $verSln = Join-Path $codeLocation "Versioning_Toolkit\.ci\code\Verification.sln"
+          if (-not (Test-Path $verSln)) {
+              Write-Host "::warning title=Full-history versioning::Verification.sln not found at $verSln — Versioning_Toolkit was not in the nightly's clone set. Skipping full-history check."
+              exit 0
+          }
+
+          dotnet restore $verSln
+          if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed for $verSln" }
+
+          # Pick the Release config that the .sln actually declares. Mirrors
+          # ci-versioning.yml's logic so behaviour is consistent between the
+          # per-PR check and this nightly invocation.
+          $slnContent = Get-Content $verSln -Raw
+          $verConfig = if ($slnContent -match '\bRelease\|Any CPU\b') {
+              'Release'
+          } else {
+              $m = [regex]::Matches($slnContent, 'Release\w+(?=\|Any CPU)')
+              if ($m.Count -gt 0) { $m[0].Value } else { 'Release' }
+          }
+          Write-Host "::notice title=Verification.sln::Building with config '$verConfig'"
+          dotnet build $verSln --no-restore -c $verConfig --nologo
+          if ($LASTEXITCODE -ne 0) { throw "dotnet build failed for $verSln" }
+
+      - name: Prepare VersioningRunner (nightly full-history)
+        id: fh-runner
+        if: github.event_name == 'schedule'
+        uses: BuroHappoldEngineeringAdmin/CI_Toolkit/.github/actions/prepare-runner@main
+        with:
+          runner_project: tools/VersioningRunner/src/VersioningRunner/VersioningRunner.csproj
+          output_dir: out\versioning-runner
+          configuration: Release
+          cache_prefix: versioning-runner
+          source_dir: tools/VersioningRunner/src
+          dotnet_version: '8.0'
+
+      - name: Run versioning (full history, fail-soft)
+        id: fh-run
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ steps.fh-runner.outputs.runner_exe }}" `
+              --assemblies "C:\ProgramData\BHoM\Assemblies" `
+              --test-all `
+              --output "$env:GITHUB_WORKSPACE\Build\versioning-fullhistory.json"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::Regression detected (exit code $LASTEXITCODE). See the attached versioning-fullhistory-${{ github.run_id }} artefact."
+          } else {
+              Write-Host "::notice title=Full-history versioning::All historical dataset versions pass."
+          }
+
+      - name: Upload full-history result
+        if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: versioning-fullhistory-${{ github.run_id }}
+          path: ${{ github.workspace }}/Build/versioning-fullhistory.json
+          if-no-files-found: warn
+          retention-days: 30
+
   # Smoke test the produced .msi: install on a vanilla Windows runner, assert
   # log markers + post-install state, then uninstall and re-assert.
   #
