@@ -17,6 +17,13 @@
 #                <alpha> for schedule and alpha dispatch
 #                <rc>    for rc dispatch
 #                <final> for final dispatch
+#   should_publish=<true|false>
+#                <false> when the scheduled-alpha path trips rule 3 (v{M}.{N}.0
+#                already shipped). The build still runs (smoke-test preserved)
+#                but the publish job is skipped; a tracking issue is opened.
+#   wix_major / wix_minor
+#                Wixproj-derived major/minor, surfaced so downstream jobs can
+#                use them without re-reading the wixproj file.
 #   source_branch=<branch>
 #   prerelease=<true|false>
 #   make_latest=<true|false>
@@ -181,6 +188,7 @@ resolve_main() {
     local today="${TODAY_OVERRIDE:-$(date -u +%y%m%d)}"
 
     local release_type source_branch prerelease make_latest release_tag msi_patch_version=""
+    local should_publish=true
 
     case "$event" in
         schedule)
@@ -188,8 +196,18 @@ resolve_main() {
             source_branch=develop
             prerelease=true
             make_latest=false
-            assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
-            release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
+            # Rule 3 is SOFT for scheduled nightlies: if v{M}.{N}.0 has already
+            # shipped on this line, we still run build + install-test (smoke
+            # preserved) but skip publish and emit a wixproj-bump warning.
+            # The dispatched paths below treat rule 3 as a hard fail because
+            # a human deliberately initiated those runs.
+            if assert_no_shipped_release_for "$wix_m" "$wix_n" 2>/dev/null; then
+                release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
+            else
+                should_publish=false
+                release_tag=""
+                printf '::warning title=Wixproj bump needed::v%s.%s.0 already shipped on this line. Bump BHoM_Installer.wixproj MinorVersion (or MajorVersion) on develop before the next nightly so it can publish.\n' "$wix_m" "$wix_n" >&2
+            fi
             # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
             ;;
 
@@ -245,6 +263,9 @@ resolve_main() {
     printf 'make_latest=%s\n'       "$make_latest"
     printf 'release_tag=%s\n'       "$release_tag"
     printf 'msi_patch_version=%s\n' "$msi_patch_version"
+    printf 'should_publish=%s\n'    "$should_publish"
+    printf 'wix_major=%s\n'         "$wix_m"
+    printf 'wix_minor=%s\n'         "$wix_n"
 }
 
 err() { printf '::error::%s\n' "$*" >&2; }
@@ -501,16 +522,50 @@ EOF
         *) assert_equal "rule 6: final + feature/X fails" "ok" "got: $out" ;;
     esac
 
-    # schedule when v9.2.0 already shipped -> rule 3 fires.
+    # schedule when v9.2.0 already shipped -> rule 3 SOFT: should_publish=false,
+    # no error exit, warning emitted to stderr.
     export GITHUB_EVENT_NAME=schedule GITHUB_REF_NAME=develop \
         INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "schedule + v9.2.0 shipped -> should_publish=false" "false" \
+        "$(echo "$out" | grep '^should_publish=' | cut -d= -f2)"
+    assert_equal "schedule + v9.2.0 shipped -> release_tag empty" "" \
+        "$(echo "$out" | grep '^release_tag=' | cut -d= -f2)"
+    assert_equal "schedule + v9.2.0 shipped -> release_type still alpha" "alpha" \
+        "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
+
+    # And the warning is on stderr; the exit code is 0 (soft, not hard).
+    err_out=$(lookup_tags()    { :; }; \
+              lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
+              resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$err_out" in
+        *"Wixproj bump needed"*"exit=0") assert_equal "rule 3 soft on schedule emits warning, exits 0" "ok" "ok" ;;
+        *) assert_equal "rule 3 soft on schedule emits warning, exits 0" "ok" "got: $err_out" ;;
+    esac
+
+    # Dispatched alpha when v9.2.0 shipped -> rule 3 HARD (user explicit).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
+        INPUT_RELEASE_TYPE=alpha INPUT_SOURCE_BRANCH=""
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"already been released"*"exit=2") assert_equal "rule 3 trips on alpha when v9.2.0 shipped" "ok" "ok" ;;
-        *) assert_equal "rule 3 trips on alpha when v9.2.0 shipped" "ok" "got: $out" ;;
+        *"already been released"*"exit=2") assert_equal "rule 3 hard on alpha dispatch when v9.2.0 shipped" "ok" "ok" ;;
+        *) assert_equal "rule 3 hard on alpha dispatch when v9.2.0 shipped" "ok" "got: $out" ;;
     esac
+
+    # Default schedule (no shipped release) -> should_publish=true.
+    export GITHUB_EVENT_NAME=schedule GITHUB_REF_NAME=develop \
+        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "schedule + no shipped release -> should_publish=true" "true" \
+        "$(echo "$out" | grep '^should_publish=' | cut -d= -f2)"
+    assert_equal "schedule -> wix_major=9 wix_minor=2 surfaced" "9 2" \
+        "$(echo "$out" | grep -E '^wix_(major|minor)=' | cut -d= -f2 | xargs)"
 
     # Rule 6: rc dispatch with feature branch -> exit 2
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \

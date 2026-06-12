@@ -71,6 +71,9 @@ jobs:
       make_latest:       ${{ steps.r.outputs.make_latest }}
       release_tag:       ${{ steps.r.outputs.release_tag }}
       msi_patch_version: ${{ steps.r.outputs.msi_patch_version }}
+      should_publish:    ${{ steps.r.outputs.should_publish }}
+      wix_major:         ${{ steps.r.outputs.wix_major }}
+      wix_minor:         ${{ steps.r.outputs.wix_minor }}
     steps:
       - name: Checkout (sparse) for the wixproj and resolve script
         uses: actions/checkout@v4
@@ -91,7 +94,7 @@ jobs:
           set -euo pipefail
           bash scripts/resolve-release-tag.sh >> "$GITHUB_OUTPUT"
           echo "::notice::Resolved parameters:"
-          grep -E '^(release_type|source_branch|prerelease|make_latest|release_tag|msi_patch_version)=' "$GITHUB_OUTPUT"
+          grep -E '^(release_type|source_branch|prerelease|make_latest|release_tag|msi_patch_version|should_publish|wix_major|wix_minor)=' "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ needs.resolve.outputs.release_type }} installer
@@ -442,7 +445,11 @@ jobs:
   publish:
     name: Publish ${{ needs.resolve.outputs.release_type }} release
     needs: [resolve, build, install-test]
-    if: success()
+    # Skipped when should_publish=false (scheduled nightly + rule 3 soft trip:
+    # v{M}.{N}.0 already shipped on this line). Build + install-test still ran
+    # to preserve the smoke signal; the post-ship-bump-needed job below opens
+    # a tracking issue.
+    if: success() && needs.resolve.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -565,6 +572,40 @@ jobs:
             artefact/dep-manifest.json
           make_latest: ${{ needs.resolve.outputs.make_latest }}
           prerelease:  ${{ needs.resolve.outputs.prerelease }}
+
+  # Soft-fail path. When the resolve job sets should_publish=false (rule 3
+  # tripped on a scheduled nightly because v{M}.{N}.0 has already shipped),
+  # the publish job above is skipped. This job opens or comments on a
+  # tracking issue so the wixproj bump does not rot silently. Only fires
+  # when build + install-test were green AND publish was deliberately skipped
+  # via the should_publish gate; a hard build/test failure flows to
+  # notify-on-failure instead.
+  post-ship-bump-needed:
+    name: Open issue for wixproj bump needed
+    needs: [resolve, build, install-test]
+    if: |
+      always() &&
+      needs.resolve.outputs.should_publish == 'false' &&
+      needs.build.result == 'success' &&
+      needs.install-test.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Checkout installer repo (for the notify script)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/notify-bump-needed.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN:  ${{ github.token }}
+          WIX_MAJOR: ${{ needs.resolve.outputs.wix_major }}
+          WIX_MINOR: ${{ needs.resolve.outputs.wix_minor }}
+        run: bash scripts/notify-bump-needed.sh
 
   # Open a GitHub Issue when an unattended build fails, so the breakage does
   # not rot silently. Fires on:
