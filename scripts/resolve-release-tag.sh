@@ -9,12 +9,15 @@
 #   GITHUB_EVENT_NAME    'schedule' | 'workflow_dispatch' | 'push'
 #   GITHUB_REF_NAME      For 'push': the pushed tag (e.g. 'v9.2.0').
 #   GITHUB_REPOSITORY    'owner/repo' for the gh API calls.
-#   INPUT_RELEASE_TYPE   'alpha' | 'beta' on workflow_dispatch; empty otherwise.
+#   INPUT_RELEASE_TYPE   'alpha' | 'rc' on workflow_dispatch; empty otherwise.
 #   INPUT_SOURCE_BRANCH  Branch to build from on alpha dispatch; default 'develop'.
 #   GH_TOKEN             For gh api calls. Workflow's github.token is sufficient.
 #
 # Outputs (stdout):
-#   release_type=<alpha|beta>
+#   release_type=<alpha|rc|beta>
+#                <alpha> for schedule and alpha dispatch
+#                <rc>    for rc dispatch
+#                <beta>  for tag-push (final release)
 #   source_branch=<branch>
 #   prerelease=<true|false>
 #   make_latest=<true|false>
@@ -91,11 +94,11 @@ compute_alpha_tag() {
     printf '%s.%d\n' "$prefix" "$((max + 1))"
 }
 
-# Compute the beta-pre-release tag for a given Major, Minor.
-# Tag format: vM.N.0-beta.counter where counter is monotonic per (M,N,0).
-compute_beta_tag() {
+# Compute the RC pre-release tag for a given Major, Minor.
+# Tag format: vM.N.0-rc.counter where counter is monotonic per (M,N,0).
+compute_rc_tag() {
     local m="$1" n="$2"
-    local prefix="v${m}.${n}.0-beta"
+    local prefix="v${m}.${n}.0-rc"
     local existing
     existing=$(lookup_tags | grep -E "^${prefix}\\.[0-9]+\$" || true)
 
@@ -152,13 +155,13 @@ assert_release_not_already_published() {
     fi
 }
 
-# Conflict rule 6: beta dispatches must build from develop. The silent
+# Conflict rule 6: RC dispatches must build from develop. The silent
 # override in earlier versions was a UX bug. The user's source_branch input
 # was discarded with no signal. Fail fast instead so the user notices.
-assert_beta_source_branch_is_develop() {
+assert_rc_source_branch_is_develop() {
     local in_branch="$1"
     if [ -n "$in_branch" ] && [ "$in_branch" != "develop" ]; then
-        err "Beta dispatches must build from develop. Got source_branch='$in_branch'. Re-dispatch with source_branch=develop (or leave it empty), or use release_type=alpha to build from '$in_branch'."
+        err "RC dispatches must build from develop. Got source_branch='$in_branch'. Re-dispatch with source_branch=develop (or leave it empty), or use release_type=alpha to build from '$in_branch'."
         return 2
     fi
 }
@@ -200,17 +203,17 @@ resolve_main() {
                     release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
                     # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
                     ;;
-                beta)
-                    assert_beta_source_branch_is_develop "$in_branch" || return 2
-                    # Beta dispatch always builds from develop regardless of input.
+                rc)
+                    assert_rc_source_branch_is_develop "$in_branch" || return 2
+                    # RC dispatch always builds from develop regardless of input.
                     source_branch=develop
                     assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
-                    release_tag=$(compute_beta_tag "$wix_m" "$wix_n")
-                    # MSI PatchVersion = the beta counter (e.g. v9.2.0-beta.3 -> 3).
-                    msi_patch_version="${release_tag##*-beta.}"
+                    release_tag=$(compute_rc_tag "$wix_m" "$wix_n")
+                    # MSI PatchVersion = the RC counter (e.g. v9.2.0-rc.3 -> 3).
+                    msi_patch_version="${release_tag##*-rc.}"
                     ;;
                 *)
-                    err "Unknown release_type '$release_type' (expected alpha or beta)"
+                    err "Unknown release_type '$release_type' (expected alpha or rc)"
                     return 3
                     ;;
             esac
@@ -329,21 +332,21 @@ EOF
             --jq '.[].ref | sub("^refs/tags/"; "")'
     }
 
-    # ── compute_beta_tag ──
-    # Tag format: vM.N.0-beta.counter, counter starts at 1.
+    # ── compute_rc_tag ──
+    # Tag format: vM.N.0-rc.counter, counter starts at 1.
 
     lookup_tags() { :; }
-    assert_equal "beta first" "v9.2.0-beta.1" "$(compute_beta_tag 9 2)"
+    assert_equal "rc first" "v9.2.0-rc.1" "$(compute_rc_tag 9 2)"
 
-    lookup_tags() { printf '%s\n' "v9.2.0-beta.1"; }
-    assert_equal "beta second" "v9.2.0-beta.2" "$(compute_beta_tag 9 2)"
+    lookup_tags() { printf '%s\n' "v9.2.0-rc.1"; }
+    assert_equal "rc second" "v9.2.0-rc.2" "$(compute_rc_tag 9 2)"
 
-    lookup_tags() { printf '%s\n' "v9.2.0-beta.1" "v9.2.0-beta.2" "v9.2.0-beta.5"; }
-    assert_equal "beta after gap" "v9.2.0-beta.6" "$(compute_beta_tag 9 2)"
+    lookup_tags() { printf '%s\n' "v9.2.0-rc.1" "v9.2.0-rc.2" "v9.2.0-rc.5"; }
+    assert_equal "rc after gap" "v9.2.0-rc.6" "$(compute_rc_tag 9 2)"
 
-    # Alpha tags do not influence the beta counter.
+    # Alpha tags do not influence the rc counter.
     lookup_tags() { printf '%s\n' "v9.2.0-alpha.260605" "v9.2.0-alpha.260605.2"; }
-    assert_equal "beta ignores alpha tags" "v9.2.0-beta.1" "$(compute_beta_tag 9 2)"
+    assert_equal "rc ignores alpha tags" "v9.2.0-rc.1" "$(compute_rc_tag 9 2)"
 
     unset -f lookup_tags
     lookup_tags() {
@@ -424,15 +427,15 @@ EOF
     assert_equal "schedule -> make_latest=false"      "false"                "$(echo "$out" | grep '^make_latest='   | cut -d= -f2)"
     assert_equal "schedule -> release_tag computed"   "v9.2.0-alpha.260605"  "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
 
-    # workflow_dispatch beta -> beta-pre-release.
+    # workflow_dispatch rc -> rc pre-release.
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE=beta INPUT_SOURCE_BRANCH=develop
+        INPUT_RELEASE_TYPE=rc INPUT_SOURCE_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "dispatch beta -> release_type=beta"      "beta"            "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
-    assert_equal "dispatch beta -> source_branch=develop"  "develop"         "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
-    assert_equal "dispatch beta -> tag=v9.2.0-beta.1"      "v9.2.0-beta.1"   "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
+    assert_equal "dispatch rc -> release_type=rc"          "rc"              "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
+    assert_equal "dispatch rc -> source_branch=develop"    "develop"         "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
+    assert_equal "dispatch rc -> tag=v9.2.0-rc.1"          "v9.2.0-rc.1"     "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
 
     # workflow_dispatch alpha with source_branch.
     export GITHUB_EVENT_NAME=workflow_dispatch \
@@ -462,13 +465,13 @@ EOF
           resolve_main 2>/dev/null)
     assert_equal "push v9.2.5 -> msi_patch=5"         "5"        "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
-    # workflow_dispatch beta -> msi_patch equals the counter.
+    # workflow_dispatch rc -> msi_patch equals the counter.
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE=beta INPUT_SOURCE_BRANCH=""
-    out=$(lookup_tags()    { printf '%s\n' "v9.2.0-beta.1" "v9.2.0-beta.2"; }; \
+        INPUT_RELEASE_TYPE=rc INPUT_SOURCE_BRANCH=""
+    out=$(lookup_tags()    { printf '%s\n' "v9.2.0-rc.1" "v9.2.0-rc.2"; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "beta dispatch -> msi_patch=3 (next counter)" "3" \
+    assert_equal "rc dispatch -> msi_patch=3 (next counter)" "3" \
         "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
     # workflow_dispatch alpha -> msi_patch empty (Build-Installer.ps1 defaults to yyMMdd).
@@ -501,33 +504,33 @@ EOF
         *) assert_equal "rule 3 trips on alpha when v9.2.0 shipped" "ok" "got: $out" ;;
     esac
 
-    # Rule 6: beta dispatch with feature branch -> exit 2
+    # Rule 6: rc dispatch with feature branch -> exit 2
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE=beta INPUT_SOURCE_BRANCH=feature/X
+        INPUT_RELEASE_TYPE=rc INPUT_SOURCE_BRANCH=feature/X
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"Beta dispatches must build from develop"*"exit=2") assert_equal "rule 6: beta + feature/X fails" "ok" "ok" ;;
-        *) assert_equal "rule 6: beta + feature/X fails" "ok" "got: $out" ;;
+        *"RC dispatches must build from develop"*"exit=2") assert_equal "rule 6: rc + feature/X fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: rc + feature/X fails" "ok" "got: $out" ;;
     esac
 
-    # Rule 6: beta dispatch with main -> exit 2
+    # Rule 6: rc dispatch with main -> exit 2
     export INPUT_SOURCE_BRANCH=main
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"Beta dispatches must build from develop"*"exit=2") assert_equal "rule 6: beta + main fails" "ok" "ok" ;;
-        *) assert_equal "rule 6: beta + main fails" "ok" "got: $out" ;;
+        *"RC dispatches must build from develop"*"exit=2") assert_equal "rule 6: rc + main fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: rc + main fails" "ok" "got: $out" ;;
     esac
 
-    # Rule 6: beta dispatch with empty source_branch -> succeeds
+    # Rule 6: rc dispatch with empty source_branch -> succeeds
     export INPUT_SOURCE_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "rule 6: beta + empty source_branch succeeds" "beta" \
+    assert_equal "rule 6: rc + empty source_branch succeeds" "rc" \
         "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
 
     rm -f "$wixproj_tmp"

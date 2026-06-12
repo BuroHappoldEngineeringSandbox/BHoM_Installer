@@ -7,7 +7,7 @@
 #                       only. release_type=alpha, prerelease=true.
 #
 #   workflow_dispatch   Manual run. The 'release_type' input chooses alpha or
-#                       beta; beta is intended for use during a feature-freeze
+#                       rc; rc is intended for use during a feature-freeze
 #                       window. prerelease=true in both cases.
 #
 #   push: tags 'v*'     Finalised release. The tag (e.g. v9.2.0) is pushed to
@@ -22,15 +22,15 @@ on:
     inputs:
       release_type:
         description: |
-          alpha — alpha pre-release. Tag: vM.N.P-alpha.YYMMDD[.counter]
-          beta  — beta pre-release (use during feature-freeze QA).
-                  Tag: vM.N.P-beta.counter
+          alpha — alpha pre-release. Tag: vM.N.0-alpha.YYMMDD[.counter]
+          rc    — release candidate (use during feature-freeze QA).
+                  Tag: vM.N.0-rc.counter
           Final beta releases are produced ONLY by pushing a 'v*' git tag,
           never via this dispatch.
         type: choice
         options:
           - alpha
-          - beta
+          - rc
         default: alpha
       source_branch:
         description: |
@@ -203,7 +203,7 @@ jobs:
           }
           # Only forward MSI_PATCH_VERSION when resolve emitted one. Alpha
           # leaves it blank so Build-Installer.ps1 falls through to its yyMMdd
-          # default (line 68-70). Beta-pre-release and beta-release flavours
+          # default (line 68-70). RC pre-release and final-release flavours
           # set it explicitly so the MSI filename matches the release tag.
           if ($env:MSI_PATCH_VERSION) { $splat['PatchVersion'] = $env:MSI_PATCH_VERSION }
 
@@ -427,7 +427,7 @@ jobs:
   #
   #   schedule        alpha       prerelease=true   tag = alpha-{YYYYMMDD-HHMMSS}
   #   dispatch alpha  alpha       prerelease=true   tag = alpha-{YYYYMMDD-HHMMSS}
-  #   dispatch beta   beta        prerelease=true   tag = beta-{YYYYMMDD-HHMMSS}
+  #   dispatch rc     rc          prerelease=true   tag = rc-{YYYYMMDD-HHMMSS}
   #   push v*         beta        prerelease=false  tag = the git tag (e.g. v9.2.0), marked Latest
   #
   # Each release is preserved (no rolling tag, no overwrite). History
@@ -479,6 +479,7 @@ jobs:
               tag="${RELEASE_TYPE}-${ts}"
               case "$RELEASE_TYPE" in
                   alpha) human="Alpha Installer" ;;
+                  rc)    human="Release Candidate Installer" ;;
                   beta)  human="Beta Installer" ;;
                   *)     human="${RELEASE_TYPE^} Installer" ;;
               esac

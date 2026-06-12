@@ -15,8 +15,12 @@
     Azure Pipelines path, which is being retired alongside BHoMBot).
 
 .PARAMETER ReleaseType
-    'alpha' or 'beta'. Drives the WiX ReleaseType property and whether
+    'alpha', 'rc', or 'beta'. Drives the WiX ReleaseType property and whether
     alphaIncludes.txt + alphaConfigs.txt are added to the clone set.
+    'rc' (release candidate) builds the beta-tier set and is passed to WiX as
+    'beta' so the wixproj's ReleaseVersion mapping stays unchanged. The
+    distinction between 'rc' and 'beta' lives in the GitHub Release flags
+    (prerelease vs final), not in the .msi itself.
 
 .PARAMETER PatchVersion
     Patch version, yyMMdd format. Defaults to today.
@@ -38,7 +42,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('alpha', 'beta')]
+    [ValidateSet('alpha', 'rc', 'beta')]
     [string]$ReleaseType,
 
     [string]$PatchVersion,
@@ -271,13 +275,18 @@ Write-Host "::group::Build installer ($ReleaseType, patch=$PatchVersion)"
 & $nuget restore $installerSln
 if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed for installer solution" }
 
+# Map ReleaseType to the WiX ReleaseType property. The wixproj only declares
+# branches for 'alpha' and 'beta', so 'rc' collapses to 'beta' here (both are
+# beta-tier builds; the distinction lives in the GitHub Release flags).
+$wixReleaseType = if ($ReleaseType -eq 'rc') { 'beta' } else { $ReleaseType }
+
 $msbuildArgs = @(
     $installerSln,
     '-nologo',
     '-verbosity:minimal',
     '-p:RunWixToolsOutOfProc=true',
     '-p:DeployOnBuild=true',
-    "-p:ReleaseType=$ReleaseType",
+    "-p:ReleaseType=$wixReleaseType",
     "-p:PatchVersion=$PatchVersion",
     '-p:WebPublishMethod=Package',
     '-p:PackageAsSingleFile=true',
