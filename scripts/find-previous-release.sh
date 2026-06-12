@@ -43,7 +43,7 @@ parse_stable_tag() {
 # REQ_IS_PRERELEASE.
 parse_release_tag() {
     local tag="$1"
-    if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-(alpha|beta)(\.[0-9a-zA-Z.]+)?$ ]]; then
+    if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-(alpha|beta|rc)(\.[0-9a-zA-Z.]+)?$ ]]; then
         REQ_M="${BASH_REMATCH[1]}"
         REQ_N="${BASH_REMATCH[2]}"
         REQ_P="${BASH_REMATCH[3]}"
@@ -194,10 +194,18 @@ self_test() {
         "anchor_tag=v9.2.0" \
         "$(echo "$out" | grep '^anchor_tag=')"
 
-    # Case 4: ignores alpha/beta tags as candidates
-    lookup_releases() { printf '%s\n' "v9.1.0-alpha.260101" "v9.1.0-beta.1" "v9.1.0"; }
+    # Case 4: ignores alpha/beta/rc tags as candidates
+    lookup_releases() { printf '%s\n' "v9.1.0-alpha.260101" "v9.1.0-beta.1" "v9.1.0-rc.1" "v9.1.0"; }
     out=$(main "v9.2.0-alpha.260605")
     assert_equal "case 4: only stable tags are candidates" \
+        "anchor_tag=v9.1.0" \
+        "$(echo "$out" | grep '^anchor_tag=')"
+
+    # Case 4b: rc release-tag parses correctly (regression guard for the
+    # PR #14 rename that originally missed this script).
+    lookup_releases() { printf '%s\n' "v9.1.0"; }
+    out=$(main "v9.2.0-rc.4")
+    assert_equal "case 4b: rc tag parses, anchors against v9.1.0" \
         "anchor_tag=v9.1.0" \
         "$(echo "$out" | grep '^anchor_tag=')"
 
