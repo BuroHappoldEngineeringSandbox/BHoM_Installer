@@ -68,11 +68,11 @@ case "${RELEASE_TYPE}" in
         ;;
 esac
 
-# Optional "Source branch" provenance row, only when non-canonical.
-source_branch_row=""
-if [ "$is_non_canonical" = "true" ]; then
-    source_branch_row="| Source branch | \`${SOURCE_BRANCH}\` |"
-fi
+# Source branch is always rendered for explicit provenance. Canonical builds
+# (alpha/rc from develop, final from main) previously omitted the row because
+# the source was implied; making it always-present means a reader does not
+# need to know the convention to interpret the build.
+source_branch_row="| Source branch | \`${SOURCE_BRANCH}\` |"
 
 # Per-OS test results from the workflow's Jobs API.
 jobs_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate)

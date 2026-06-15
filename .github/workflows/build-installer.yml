@@ -424,7 +424,7 @@ jobs:
           source_dir: tools/VersioningRunner/src
           dotnet_version: '8.0'
 
-      - name: Run versioning (full history, fail-soft)
+      - name: Run versioning (full-history, fail-soft)
         id: fh-run
         if: github.event_name == 'schedule' || inputs.run_full_history
         continue-on-error: true

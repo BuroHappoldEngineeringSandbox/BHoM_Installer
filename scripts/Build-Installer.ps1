@@ -103,11 +103,11 @@ if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
 
 $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
 if (-not $msbuild) { throw "MSBuild not located via vswhere" }
-Write-Host "::notice::MSBuild → $msbuild"
+Write-Host "MSBuild: $msbuild"
 
 $nuget = (Get-Command nuget.exe -ErrorAction SilentlyContinue)?.Source
 if (-not $nuget) { throw "nuget.exe not on PATH" }
-Write-Host "::notice::NuGet → $nuget"
+Write-Host "NuGet: $nuget"
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -130,7 +130,7 @@ function Clone-Repo {
     # rather than silently falling back to the default branch.
     git clone --depth 1 --branch $MainBranch "https://github.com/$OrgRepo.git" $target 2>&1 | ForEach-Object { Write-Host "  $_" }
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "::warning::Clone of $OrgRepo failed on branch '$MainBranch'; retrying with default branch"
+        Write-Host "::warning::Branch '$MainBranch' not found on $OrgRepo. Falling back to repository default branch."
         git clone --depth 1 "https://github.com/$OrgRepo.git" $target 2>&1 | ForEach-Object { Write-Host "  $_" }
         if ($LASTEXITCODE -ne 0) { throw "git clone failed for $OrgRepo" }
     }
@@ -263,7 +263,8 @@ $includedDllsTxt = Join-Path $settingsDir 'IncludedDLLs.txt'
 
 New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null
 $dlls | Set-Content $includedDllsTxt
-Write-Host "::notice::Wrote $($dlls.Count) DLLs to $includedDllsTxt"
+Write-Host "::notice::Staged $($dlls.Count) DLLs for the installer payload."
+Write-Host "IncludedDLLs.txt: $includedDllsTxt"
 
 # ─── Build the installer .sln itself ────────────────────────────────────────
 
@@ -314,7 +315,8 @@ $msi = Get-ChildItem $buildDir -Filter '*.msi' -ErrorAction SilentlyContinue | S
 if (-not $msi) { throw "No .msi produced in $buildDir" }
 
 $sizeMB = [math]::Round($msi.Length / 1MB, 2)
-Write-Host "::notice::Installer built: $($msi.FullName) ($sizeMB MB)"
+Write-Host "::notice::Installer built: $($msi.Name) ($sizeMB MB)"
+Write-Host "Full path: $($msi.FullName)"
 
 # Also copy to GITHUB_WORKSPACE\Build\ so actions/upload-artifact finds it via
 # the workflow's static path (workspace-relative). Skip when MSBuild already
@@ -326,9 +328,9 @@ if ($env:GITHUB_WORKSPACE) {
     $workspaceBuildResolved = (Resolve-Path $workspaceBuild).Path
     if ($msi.DirectoryName -ne $workspaceBuildResolved) {
         Copy-Item $msi.FullName $workspaceBuild -Force
-        Write-Host "::notice::Copied to $workspaceBuild for artefact upload"
+        Write-Host "Copied .msi to workspace Build/ for artefact upload."
     } else {
-        Write-Host "::notice::.msi already in $workspaceBuild, no copy needed"
+        Write-Host "Skipped copy: .msi already in workspace Build/."
     }
 }
 
