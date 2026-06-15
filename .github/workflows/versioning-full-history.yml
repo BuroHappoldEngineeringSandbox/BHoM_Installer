@@ -1,0 +1,281 @@
+# Full-history versioning check. Validates that the BHoM .NET assemblies in
+# the most recent published release still deserialise every historical JSON
+# dataset (test_all=true) without regression.
+#
+# Decoupled from build-installer.yml (see 2026-06-15 session note). Mirrors
+# BHoMBot's separation of concerns: `_alphaInstallerTimer` produced the .msi;
+# `_testingTimer` ran the equivalent of `RunVersioning("full")` two hours
+# later, independently. The signal is about assemblies, not about packaging.
+#
+# Trigger model:
+#   schedule           Nightly 02:00 UTC, after the alpha nightly settles.
+#   workflow_dispatch  Ad-hoc, with optional overrides:
+#                        - test_toolkit_repo: fork override
+#                        - release_tag: validate a specific historical release
+#                          instead of the latest. Useful for retrospective
+#                          regression-hunting on shipped builds.
+#
+# Non-blocking by design. Per the 2026-06-15 architecture review:
+# full-history is the ecosystem-wide catch-everything safety net; the per-PR
+# Versioning check (CI_Toolkit/ci-versioning.yml) is the gating
+# author-attributable signal.
+
+name: Versioning (Full History)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 02:00 UTC nightly. Offset from the 00:45 UTC alpha
+                          # build (build-installer.yml) to let the publish job
+                          # finalise the release before this workflow looks
+                          # for the latest .msi.
+
+  workflow_dispatch:
+    inputs:
+      test_toolkit_repo:
+        description: |
+          Repo containing Test_Toolkit (owner/repo). Override to point at a
+          fork in your org. Provides Test_Engine.dll / Test_oM.dll that
+          Versioning_Test.csproj references via HintPath. Mirrors the input
+          of the same name on ci-versioning.yml.
+        type: string
+        required: false
+        default: 'BHoM/Test_Toolkit'
+      release_tag:
+        description: |
+          Validate a specific release tag (e.g. v9.2.0-alpha.260615) instead
+          of the most recent. Leave blank to run against the latest published
+          release. Useful for retrospective regression-hunting.
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: versioning-full-history
+  cancel-in-progress: false
+
+jobs:
+  versioning:
+    name: Full-history versioning
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Locate target release
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $tag = $env:INPUT_RELEASE_TAG
+          if (-not $tag) {
+              # Most recent published release. Includes pre-releases (alpha,
+              # rc) and final. Sorted by publish time descending.
+              $tag = gh release list `
+                  --repo "$env:GITHUB_REPOSITORY" `
+                  --limit 1 `
+                  --json tagName `
+                  --jq '.[0].tagName'
+          }
+
+          if (-not $tag) {
+              Write-Host "::notice title=Full-history versioning::No published release found. Nothing to validate. Self-heals on the next nightly publish."
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              return
+          }
+
+          Write-Host "::notice title=Full-history versioning::Target release: $tag"
+          "tag=$tag"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Download .msi from release
+        if: steps.target.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          New-Item -ItemType Directory -Force -Path msi | Out-Null
+          gh release download "$env:TAG" `
+              --repo "$env:GITHUB_REPOSITORY" `
+              --pattern "*.msi" `
+              --dir msi
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::Failed to download .msi for $env:TAG. Skipping."
+              exit 0
+          }
+          $msi = Get-ChildItem msi -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) {
+              Write-Host "::warning title=Full-history versioning::Release $env:TAG has no .msi attached. Skipping."
+              exit 0
+          }
+          Write-Host "Downloaded: $($msi.Name) ($([math]::Round($msi.Length / 1MB, 2)) MB)"
+
+      - name: Install .msi (populate Assemblies)
+        if: steps.target.outputs.skip == 'false'
+        run: |
+          $msi = Get-ChildItem msi -Filter '*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) {
+              Write-Host "::warning title=Full-history versioning::No .msi available to install. Skipping."
+              exit 0
+          }
+
+          # /passive: progress UI but no user interaction; /L*V: verbose log
+          # for failure diagnosis.
+          $p = Start-Process msiexec `
+              -ArgumentList '/i', $msi.FullName, '/L*V', 'install.log', '/passive' `
+              -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+              Write-Host "::warning title=Full-history versioning::msiexec /i failed with exit $($p.ExitCode). Skipping. See install.log artefact."
+              exit 0
+          }
+
+          $assembliesDir = 'C:\ProgramData\BHoM\Assemblies'
+          $dllCount = (Get-ChildItem $assembliesDir -Filter '*.dll' -ErrorAction SilentlyContinue | Measure-Object).Count
+          Write-Host "::notice title=Full-history versioning::Installed. Assemblies in ${assembliesDir}: $dllCount DLLs."
+
+      - name: Clone Versioning_Toolkit + Test_Toolkit
+        if: steps.target.outputs.skip == 'false'
+        env:
+          TEST_TOOLKIT_REPO: ${{ inputs.test_toolkit_repo || 'BHoM/Test_Toolkit' }}
+        run: |
+          # Versioning_Toolkit provides .ci/code/Verification.sln and the
+          # historical datasets. Test_Toolkit provides Test_Engine.dll and
+          # Test_oM.dll that Versioning_Test.csproj references via HintPath
+          # to $(ProgramData)\BHoM\Assemblies (those DLLs are NOT in the
+          # alpha installer's payload, matching BHoMBot's separation).
+
+          $codeLocation = $env:GITHUB_WORKSPACE
+          New-Item -ItemType Directory -Force -Path $codeLocation | Out-Null
+
+          git clone --depth 1 --branch develop https://github.com/BHoM/Versioning_Toolkit.git "$codeLocation\Versioning_Toolkit" 2>&1 | ForEach-Object { Write-Host "  $_" }
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::Versioning_Toolkit clone failed (exit $LASTEXITCODE). Skipping."
+              exit 0
+          }
+
+          $testToolkitName = ($env:TEST_TOOLKIT_REPO -split '/')[1]
+          git clone --depth 1 --branch develop "https://github.com/$($env:TEST_TOOLKIT_REPO).git" "$codeLocation\$testToolkitName" 2>&1 | ForEach-Object { Write-Host "  $_" }
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::Test_Toolkit clone failed for '$($env:TEST_TOOLKIT_REPO)' (exit $LASTEXITCODE). Skipping."
+              exit 0
+          }
+
+      - name: Build Test_Toolkit (stage Test_Engine.dll + Test_oM.dll)
+        if: steps.target.outputs.skip == 'false'
+        env:
+          TEST_TOOLKIT_REPO: ${{ inputs.test_toolkit_repo || 'BHoM/Test_Toolkit' }}
+        run: |
+          $testToolkitName = ($env:TEST_TOOLKIT_REPO -split '/')[1]
+          $sln = Join-Path $env:GITHUB_WORKSPACE "$testToolkitName\$testToolkitName.sln"
+          if (-not (Test-Path $sln)) {
+              Write-Host "::warning title=Full-history versioning::No solution at $sln. Skipping."
+              exit 0
+          }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) {
+              Write-Host "::warning title=Full-history versioning::MSBuild not located via vswhere. Skipping."
+              exit 0
+          }
+
+          & nuget restore $sln -Verbosity quiet
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::NuGet restore failed for $sln (exit $LASTEXITCODE). Skipping."
+              exit 0
+          }
+
+          & $msbuild $sln -nologo -verbosity:minimal -p:Configuration=Release
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::MSBuild failed for $sln (exit $LASTEXITCODE). Skipping."
+              exit 0
+          }
+
+          $staged = Get-ChildItem 'C:\ProgramData\BHoM\Assemblies' -Filter 'Test_*.dll' -ErrorAction SilentlyContinue
+          Write-Host "::notice title=Full-history versioning::Test_Toolkit staged. Test_*.dll in Assemblies: $($staged.Count)"
+
+      - name: Build Verification.sln
+        if: steps.target.outputs.skip == 'false'
+        run: |
+          $verSln = Join-Path $env:GITHUB_WORKSPACE 'Versioning_Toolkit\.ci\code\Verification.sln'
+          if (-not (Test-Path $verSln)) {
+              Write-Host "::warning title=Full-history versioning::Verification.sln not found at $verSln. Skipping."
+              exit 0
+          }
+
+          dotnet restore $verSln
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::dotnet restore failed for $verSln (exit $LASTEXITCODE). Skipping."
+              exit 0
+          }
+
+          # Pick the Release config that the .sln actually declares. Mirrors
+          # ci-versioning.yml's logic so behaviour is consistent between the
+          # per-PR check and this workflow.
+          $slnContent = Get-Content $verSln -Raw
+          $verConfig = if ($slnContent -match '\bRelease\|Any CPU\b') {
+              'Release'
+          } else {
+              $m = [regex]::Matches($slnContent, 'Release\w+(?=\|Any CPU)')
+              if ($m.Count -gt 0) { $m[0].Value } else { 'Release' }
+          }
+          Write-Host "::notice title=Full-history versioning::Building Verification.sln with config '$verConfig'."
+
+          dotnet build $verSln --no-restore -c $verConfig --nologo
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::dotnet build failed for $verSln (exit $LASTEXITCODE). Skipping."
+              exit 0
+          }
+
+      - name: Prepare VersioningRunner
+        id: fh-runner
+        if: steps.target.outputs.skip == 'false'
+        uses: BuroHappoldEngineeringAdmin/CI_Toolkit/.github/actions/prepare-runner@main
+        with:
+          runner_project: tools/VersioningRunner/src/VersioningRunner/VersioningRunner.csproj
+          output_dir: out\versioning-runner
+          configuration: Release
+          cache_prefix: versioning-runner
+          source_dir: tools/VersioningRunner/src
+          dotnet_version: '8.0'
+
+      - name: Run versioning (full-history, fail-soft)
+        id: fh-run
+        if: steps.target.outputs.skip == 'false'
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\Build" | Out-Null
+
+          & "${{ steps.fh-runner.outputs.runner_exe }}" `
+              --assemblies "C:\ProgramData\BHoM\Assemblies" `
+              --test-all `
+              --output "$env:GITHUB_WORKSPACE\Build\versioning-fullhistory.json"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::Regression detected (exit code $LASTEXITCODE). See the attached versioning-fullhistory-${{ github.run_id }} artefact."
+          } else {
+              Write-Host "::notice title=Full-history versioning::All historical dataset versions pass."
+          }
+
+      - name: Upload full-history result
+        if: always() && steps.target.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: versioning-fullhistory-${{ github.run_id }}
+          path: ${{ github.workspace }}/Build/versioning-fullhistory.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload install log on failure
+        if: failure() && steps.target.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: msiexec-install-log-${{ github.run_id }}
+          path: install.log
+          if-no-files-found: ignore
+          retention-days: 7
