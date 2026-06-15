@@ -7,8 +7,18 @@
 # `_testingTimer` ran the equivalent of `RunVersioning("full")` two hours
 # later, independently. The signal is about assemblies, not about packaging.
 #
-# Trigger model:
-#   schedule           Nightly 02:00 UTC, after the alpha nightly settles.
+# CURRENTLY DORMANT (2026-06-15). The workflow ships with workflow_dispatch
+# only; no schedule trigger. The core logic is in place for ad-hoc dispatches
+# and as the design anchor, but the workflow does not auto-run while focus is
+# on installer-build optimisations. To re-enable nightly cadence, add back:
+#
+#     schedule:
+#       - cron: '0 2 * * *'   # 02:00 UTC, offset from the 00:45 UTC alpha
+#                             # build so the publish job finalises the
+#                             # release before this workflow looks for the
+#                             # latest .msi.
+#
+# Trigger model (current):
 #   workflow_dispatch  Ad-hoc, with optional overrides:
 #                        - test_toolkit_repo: fork override
 #                        - release_tag: validate a specific historical release
@@ -23,12 +33,6 @@
 name: Versioning (Full History)
 
 on:
-  schedule:
-    - cron: '0 2 * * *'   # 02:00 UTC nightly. Offset from the 00:45 UTC alpha
-                          # build (build-installer.yml) to let the publish job
-                          # finalise the release before this workflow looks
-                          # for the latest .msi.
-
   workflow_dispatch:
     inputs:
       test_toolkit_repo:
