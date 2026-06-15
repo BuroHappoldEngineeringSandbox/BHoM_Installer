@@ -100,7 +100,7 @@ jobs:
     name: Build ${{ needs.resolve.outputs.release_type }} installer
     needs: resolve
     runs-on: windows-2025-vs2026
-    timeout-minutes: 180   # generous; tighten once we know real duration
+    timeout-minutes: 30    # ~14 min observed wall-clock post-decoupling; 2x headroom
     defaults:
       run:
         shell: pwsh
