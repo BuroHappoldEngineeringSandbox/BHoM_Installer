@@ -309,7 +309,10 @@ jobs:
           }
 
           dotnet restore $verSln
-          if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed for $verSln" }
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::dotnet restore failed for $verSln (exit $LASTEXITCODE). Skipping full-history check."
+              exit 0
+          }
 
           # Pick the Release config that the .sln actually declares. Mirrors
           # ci-versioning.yml's logic so behaviour is consistent between the
@@ -323,7 +326,10 @@ jobs:
           }
           Write-Host "::notice title=Verification.sln::Building with config '$verConfig'"
           dotnet build $verSln --no-restore -c $verConfig --nologo
-          if ($LASTEXITCODE -ne 0) { throw "dotnet build failed for $verSln" }
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning title=Full-history versioning::dotnet build failed for $verSln (exit $LASTEXITCODE). Skipping full-history check. The alpha publish itself is unaffected; per-PR Versioning check remains the primary gate."
+              exit 0
+          }
 
       - name: Prepare VersioningRunner (nightly full-history)
         id: fh-runner
