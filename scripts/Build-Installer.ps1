@@ -37,6 +37,13 @@
 .PARAMETER MainBranch
     Branch to clone each dep from. Defaults to 'develop' (matches BHoMBot's
     DevelopBranchName for alpha builds).
+
+.PARAMETER SkipDependencies
+    Skip the clone + build of dependency repos. Used when the workflow
+    restored C:\ProgramData\BHoM\Assemblies from cache, so the dep graph
+    is already staged and only the WiX packaging step needs to run.
+    Validates the cache integrity before skipping; throws if Assemblies
+    contains fewer than 200 DLLs (sanity check against a corrupted cache).
 #>
 
 [CmdletBinding()]
@@ -51,7 +58,9 @@ param(
 
     [string]$InstallerRepoName = 'BHoM_Installer',
 
-    [string]$MainBranch = 'develop'
+    [string]$MainBranch = 'develop',
+
+    [switch]$SkipDependencies
 )
 
 $ErrorActionPreference = 'Stop'
@@ -80,11 +89,12 @@ if (-not (Test-Path $installerRoot)) { throw "Installer repo not found at: $inst
 if (-not (Test-Path $manifestDir))   { throw "Manifest directory not found at: $manifestDir" }
 
 Write-Host "::group::Build configuration"
-Write-Host "ReleaseType:    $ReleaseType"
-Write-Host "PatchVersion:   $PatchVersion"
-Write-Host "MainBranch:     $MainBranch"
-Write-Host "CodeLocation:   $CodeLocation"
-Write-Host "InstallerRoot:  $installerRoot"
+Write-Host "ReleaseType:       $ReleaseType"
+Write-Host "PatchVersion:      $PatchVersion"
+Write-Host "MainBranch:        $MainBranch"
+Write-Host "CodeLocation:      $CodeLocation"
+Write-Host "InstallerRoot:     $installerRoot"
+Write-Host "SkipDependencies:  $SkipDependencies"
 Write-Host "::endgroup::"
 
 # Ensure the BHoM ProgramData directories exist. Each dep repo's PostBuildEvent
@@ -228,30 +238,44 @@ function Build-Configs-FromFile {
 # BHoMBot parallelises some of these groups. For this initial iteration we run
 # sequentially because it is easier to debug and produces deterministic output.
 # Parallelism is a Phase 1.5 optimisation once the workflow is stable.
+#
+# Gated behind -not $SkipDependencies. The workflow sets -SkipDependencies when
+# C:\ProgramData\BHoM\Assemblies was restored from cache; in that case the dep
+# graph is already staged and we skip directly to the WiX packaging stage.
 
-Clone-And-Build-FromFile -FileName 'core.txt'
-Clone-And-Build-FromFile -FileName 'adapterCore.txt'
-Clone-And-Build-FromFile -FileName 'uiCore.txt'
-Clone-And-Build-FromFile -FileName 'dependencies.txt'
-Clone-And-Build-FromFile -FileName 'include.txt'
-Clone-And-Build-FromFile -FileName 'userInterfaces.txt'
-Clone-And-Build-FromFile -FileName 'analytics.txt'        # BHE-only, absent in BHoM_Installer
-Clone-And-Build-FromFile -FileName 'zeroCode.txt'         # BHE-only, absent in BHoM_Installer
-Clone-And-Build-FromFile -FileName 'revitTools_Beta.txt'  # BHE-only, absent in BHoM_Installer
+$assembliesDirPreFlight = Join-Path $bhomProgramData 'Assemblies'
 
-Build-Configs-FromFile -FileName 'altConfigs.txt'
+if ($SkipDependencies) {
+    $existingDlls = (Get-ChildItem $assembliesDirPreFlight -Filter '*.dll' -ErrorAction SilentlyContinue | Measure-Object).Count
+    Write-Host "::notice::Skipping dependency clone + build (cache hit). Assemblies in $($assembliesDirPreFlight): $existingDlls DLLs."
+    if ($existingDlls -lt 200) {
+        throw "Cache hit was requested but $assembliesDirPreFlight contains only $existingDlls DLLs (expected ~260). Cache may be corrupted; clear it and re-run with cache miss."
+    }
+} else {
+    Clone-And-Build-FromFile -FileName 'core.txt'
+    Clone-And-Build-FromFile -FileName 'adapterCore.txt'
+    Clone-And-Build-FromFile -FileName 'uiCore.txt'
+    Clone-And-Build-FromFile -FileName 'dependencies.txt'
+    Clone-And-Build-FromFile -FileName 'include.txt'
+    Clone-And-Build-FromFile -FileName 'userInterfaces.txt'
+    Clone-And-Build-FromFile -FileName 'analytics.txt'        # BHE-only, absent in BHoM_Installer
+    Clone-And-Build-FromFile -FileName 'zeroCode.txt'         # BHE-only, absent in BHoM_Installer
+    Clone-And-Build-FromFile -FileName 'revitTools_Beta.txt'  # BHE-only, absent in BHoM_Installer
 
-# NOTE: BHoMBot calls UpdateFixedRevitVersioningTypes() here (Revit API mocks
-# for the Versioning_Toolkit build), followed by a 60-second sleep after the
-# versioning step. Both are skipped in this initial iteration. If either turns
-# out to be load-bearing, the Versioning_Toolkit build will fail or produce
-# incorrect output, at which point we add them back.
+    Build-Configs-FromFile -FileName 'altConfigs.txt'
 
-Clone-And-Build-FromFile -FileName 'versioning.txt'
+    # NOTE: BHoMBot calls UpdateFixedRevitVersioningTypes() here (Revit API mocks
+    # for the Versioning_Toolkit build), followed by a 60-second sleep after the
+    # versioning step. Both are skipped in this initial iteration. If either turns
+    # out to be load-bearing, the Versioning_Toolkit build will fail or produce
+    # incorrect output, at which point we add them back.
 
-if ($ReleaseType -eq 'alpha') {
-    Clone-And-Build-FromFile -FileName 'alphaIncludes.txt'
-    Build-Configs-FromFile   -FileName 'alphaConfigs.txt'
+    Clone-And-Build-FromFile -FileName 'versioning.txt'
+
+    if ($ReleaseType -eq 'alpha') {
+        Clone-And-Build-FromFile -FileName 'alphaIncludes.txt'
+        Build-Configs-FromFile   -FileName 'alphaConfigs.txt'
+    }
 }
 
 # ─── Write IncludedDLLs.txt (mirrors BHoMBot's SaveIncludedDLLs.cs) ─────────

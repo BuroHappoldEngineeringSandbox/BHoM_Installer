@@ -116,6 +116,109 @@ jobs:
       # BuroHappold_Installer (which bundles private BHE repos), add the
       # mint-dep-token step here.
 
+      # ─── Assemblies cache key resolution ──────────────────────────────────
+      #
+      # Cache hit shortcuts the ~9 min dep-clone + dep-build phase. The key
+      # must invalidate precisely when the build output would differ, so it
+      # encodes:
+      #   - runner.os                (binary compatibility)
+      #   - release_type             (alpha bundles alphaIncludes; rc/final do not)
+      #   - source_branch            (different branches resolve to different SHAs)
+      #   - deps_hash                (sha256 over every dep's HEAD SHA + the
+      #                               IncludedRepos manifest contents themselves,
+      #                               so altConfigs.txt edits invalidate too)
+      #
+      # SHA resolution uses parallel `git ls-remote` against each unique
+      # owner/repo across all manifests relevant to this release_type. Branch
+      # fallback mirrors Build-Installer.ps1: try $source_branch first, fall
+      # back to the repo's default branch (HEAD).
+
+      - name: Resolve dependency SHAs for cache key
+        id: deps_resolve
+        env:
+          SOURCE_BRANCH: ${{ needs.resolve.outputs.source_branch }}
+          RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
+        run: |
+          $manifests = @(
+              'core.txt', 'adapterCore.txt', 'uiCore.txt', 'dependencies.txt',
+              'include.txt', 'userInterfaces.txt', 'analytics.txt', 'zeroCode.txt',
+              'revitTools_Beta.txt', 'versioning.txt'
+          )
+          if ($env:RELEASE_TYPE -eq 'alpha') {
+              $manifests += 'alphaIncludes.txt'
+          }
+          # altConfigs / alphaConfigs reference repos already in the regular
+          # manifests but build them under alternative Release configs.
+          # Those repos are already in $repoSet via the regular manifests;
+          # the configs themselves are captured by the manifest-content hash.
+
+          $repoSet = @{}
+          foreach ($m in $manifests) {
+              $path = "IncludedRepos/$m"
+              if (-not (Test-Path $path)) { continue }
+              Get-Content $path | Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object {
+                  $parts = $_.Trim() -split '/'
+                  if ($parts.Length -ge 2) {
+                      $repoSet["$($parts[0])/$($parts[1])"] = $true
+                  }
+              }
+          }
+
+          $repos = $repoSet.Keys | Sort-Object
+          # Capture env var to a local so $using: in the parallel block is unambiguous.
+          $sourceBranch = $env:SOURCE_BRANCH
+          Write-Host "::group::Resolving SHAs for $($repos.Count) repos on branch '$sourceBranch'"
+
+          $shaResults = $repos | ForEach-Object -ThrottleLimit 16 -Parallel {
+              $repo   = $_
+              $branch = $using:sourceBranch
+              # Try requested branch first (matches Build-Installer.ps1's
+              # `git clone --branch $MainBranch` behaviour).
+              $line = git ls-remote --exit-code "https://github.com/$repo.git" "refs/heads/$branch" 2>$null | Select-Object -First 1
+              if (-not $line) {
+                  # Fall back to repo default branch HEAD (matches
+                  # Build-Installer.ps1's fallback clone without --branch).
+                  $line = git ls-remote "https://github.com/$repo.git" HEAD 2>$null | Select-Object -First 1
+              }
+              if ($line) {
+                  $sha = ($line -split '\s+')[0]
+                  "$repo:$sha"
+              } else {
+                  # Unresolved repo. Including this in the hash means the
+                  # cache always misses until network recovers, which is the
+                  # safer failure mode.
+                  "$repo:UNRESOLVED"
+              }
+          } | Sort-Object
+
+          foreach ($r in $shaResults) { Write-Host "  $r" }
+          Write-Host "::endgroup::"
+
+          # Hash the manifest file contents too. Catches altConfigs.txt and
+          # alphaConfigs.txt edits that change build output without changing
+          # dep SHAs (e.g., adding a new Release2027 config).
+          $manifestContent = (Get-ChildItem 'IncludedRepos' -Filter '*.txt' -ErrorAction SilentlyContinue |
+                              Sort-Object Name |
+                              ForEach-Object { "$($_.Name)=" + (Get-FileHash $_.FullName -Algorithm SHA256).Hash }) -join '|'
+
+          $combined = (($shaResults -join '|') + '|MANIFESTS|' + $manifestContent)
+          $bytes    = [System.Text.Encoding]::UTF8.GetBytes($combined)
+          $hash     = [System.BitConverter]::ToString(
+                        [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+                      ).Replace("-", "").ToLower().Substring(0, 16)
+
+          Write-Host "::notice::Computed deps_hash=$hash from $($repos.Count) repos and $((Get-ChildItem 'IncludedRepos\*.txt' | Measure-Object).Count) manifest files."
+          "deps_hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Restore Assemblies cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:\ProgramData\BHoM\Assemblies
+            ${{ github.workspace }}\Build\dep-manifest.json
+          key: assemblies-${{ runner.os }}-${{ needs.resolve.outputs.release_type }}-${{ needs.resolve.outputs.source_branch }}-${{ steps.deps_resolve.outputs.deps_hash }}
+
       - name: Provide .NET Framework 4.0 reference assemblies
         # InstallerCA.csproj targets .NET Framework v4.0, matching BHoMBot's
         # build exactly so that the installer source tree stays untouched. The
@@ -197,6 +300,7 @@ jobs:
           RELEASE_TYPE:      ${{ needs.resolve.outputs.release_type }}
           MSI_PATCH_VERSION: ${{ needs.resolve.outputs.msi_patch_version }}
           SOURCE_BRANCH:     ${{ needs.resolve.outputs.source_branch }}
+          CACHE_HIT:         ${{ steps.cache.outputs.cache-hit }}
         run: |
           # Hashtable splat (not array) so PowerShell binds by parameter name.
           # Array splatting would otherwise treat '-ReleaseType' as a value.
@@ -210,6 +314,16 @@ jobs:
           # set it explicitly so the MSI filename matches the release tag.
           if ($env:MSI_PATCH_VERSION) { $splat['PatchVersion'] = $env:MSI_PATCH_VERSION }
 
+          # On cache hit, Assemblies is already populated. Skip the ~9 min
+          # dep-clone + dep-build phase; Build-Installer.ps1 validates the
+          # restored cache (>=200 DLLs) before skipping.
+          if ($env:CACHE_HIT -eq 'true') {
+              Write-Host "::notice::Cache hit. Forwarding -SkipDependencies to Build-Installer.ps1."
+              $splat['SkipDependencies'] = $true
+          } else {
+              Write-Host "::notice::Cache miss. Building full dependency graph."
+          }
+
           & "$env:GITHUB_WORKSPACE\scripts\Build-Installer.ps1" @splat
 
       - name: Generate dep manifest (for release-note diffing)
@@ -218,6 +332,12 @@ jobs:
         # publish-alpha job downloads the previous release's copy of this file
         # and diffs it against this one to render "what changed since last build"
         # release notes.
+        #
+        # Skipped on cache hit because the dep repos were not cloned; the
+        # dep-manifest.json is restored from the cache alongside the
+        # Assemblies it was generated against, so the file content stays
+        # consistent with what's on disk.
+        if: steps.cache.outputs.cache-hit != 'true'
         env:
           RELEASE_TYPE: ${{ needs.resolve.outputs.release_type }}
           SOURCE_BRANCH:  ${{ needs.resolve.outputs.source_branch }}
@@ -248,6 +368,19 @@ jobs:
           $outPath = Join-Path $env:GITHUB_WORKSPACE 'Build\dep-manifest.json'
           $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $outPath -Encoding UTF8
           Write-Host "::notice::Wrote dep-manifest.json with $($depsObject.Count) deps"
+
+      # Save the Assemblies cache only on cache miss + a successful build. The
+      # primary key was generated by the `Restore Assemblies cache` step and
+      # is reused verbatim here so the cache hit lookup tomorrow finds it.
+      # Cache hit runs skip this step (the cache already exists for this key).
+      - name: Save Assemblies cache
+        if: success() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:\ProgramData\BHoM\Assemblies
+            ${{ github.workspace }}\Build\dep-manifest.json
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Assert .msi size is sane
         # Catches catastrophic packaging regressions: a tiny .msi means WiX shipped
