@@ -182,12 +182,15 @@ jobs:
               }
               if ($line) {
                   $sha = ($line -split '\s+')[0]
-                  "$repo:$sha"
+                  # ${repo} braces required: PowerShell parses `$repo:` as a
+                  # scope-qualified variable reference (like $env:VAR) and
+                  # rejects it. Same below.
+                  "${repo}:$sha"
               } else {
                   # Unresolved repo. Including this in the hash means the
                   # cache always misses until network recovers, which is the
                   # safer failure mode.
-                  "$repo:UNRESOLVED"
+                  "${repo}:UNRESOLVED"
               }
           } | Sort-Object
 
