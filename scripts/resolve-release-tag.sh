@@ -2,36 +2,43 @@
 # Resolve the release tag and downstream parameters for build-installer.yml.
 #
 # Reads workflow context from environment variables, computes the tag for
-# the current build, runs the five conflict-prevention rules, and writes
+# the current build, runs the conflict-prevention rules, and writes
 # KEY=VALUE pairs to stdout (intended to be appended to $GITHUB_OUTPUT).
 #
+# Three-input model (see proposal.md Section 6):
+#   1. Installer branch  : GITHUB_REF (the workflow's ref, set by GHA dispatch
+#                          via --ref or 'Use workflow from Branch' in the UI).
+#                          For 'final' the workflow ref must be refs/heads/main.
+#                          For 'alpha'/'rc' any branch is accepted.
+#   2. Release type      : INPUT_RELEASE_TYPE input (alpha | rc | final).
+#   3. Dependency branch : INPUT_DEPENDENCY_BRANCH input. Tried on each dep
+#                          clone; falls back to each dep's actual default
+#                          branch if not found. Convention is 'develop' for
+#                          rc and final dispatches; a non-conventional value
+#                          surfaces a warning but is not blocked.
+#
 # Inputs (env):
-#   GITHUB_EVENT_NAME    'schedule' | 'workflow_dispatch'
-#   GITHUB_REPOSITORY    'owner/repo' for the gh API calls.
-#   INPUT_RELEASE_TYPE   'alpha' | 'rc' | 'final' on workflow_dispatch; empty otherwise.
-#   INPUT_SOURCE_BRANCH  Branch to build from on alpha dispatch; default 'develop'.
-#   GH_TOKEN             For gh api calls. Workflow's github.token is sufficient.
+#   GITHUB_EVENT_NAME       'schedule' | 'workflow_dispatch'
+#   GITHUB_REPOSITORY       'owner/repo' for the gh API calls.
+#   GITHUB_REF              Full ref the workflow runs on (e.g. refs/heads/main).
+#   INPUT_RELEASE_TYPE      'alpha' | 'rc' | 'final' on workflow_dispatch.
+#   INPUT_DEPENDENCY_BRANCH Branch to try first on each dep clone; defaults to
+#                           'develop' for both schedule and dispatch when empty.
+#   GH_TOKEN                For gh api calls. Workflow's github.token suffices.
 #
 # Outputs (stdout):
 #   release_type=<alpha|rc|final>
-#                <alpha> for schedule and alpha dispatch
-#                <rc>    for rc dispatch
-#                <final> for final dispatch
-#   should_publish=<true|false>
-#                <false> when the scheduled-alpha path trips rule 3 (v{M}.{N}.0
-#                already shipped). The build still runs (smoke-test preserved)
-#                but the publish job is skipped; a tracking issue is opened.
-#   wix_major / wix_minor
-#                Wixproj-derived major/minor, surfaced so downstream jobs can
-#                use them without re-reading the wixproj file.
-#   source_branch=<branch>
+#   dependency_branch=<branch>
 #   prerelease=<true|false>
 #   make_latest=<true|false>
 #   release_tag=<the computed tag>
+#   msi_patch_version=<value>
+#   should_publish=<true|false>
+#   wix_major / wix_minor
 #
 # Exit codes:
-#   0  success
-#   2  conflict-prevention rule violation (message on stderr)
+#   0  success (warnings may be emitted to stderr; check those for non-blocking issues)
+#   2  hard rule violation (message on stderr)
 #   3  internal error / missing inputs
 
 set -euo pipefail
@@ -52,7 +59,7 @@ lookup_releases() {
         --jq '.[].tag_name'
 }
 
-# ─── core logic (filled in by subsequent tasks) ─────────────────────────────
+# ─── core logic ─────────────────────────────────────────────────────────────
 
 # Print "MAJOR MINOR" extracted from the wixproj file. Errors to stderr on
 # missing/invalid input.
@@ -148,25 +155,37 @@ assert_release_not_already_published() {
     fi
 }
 
-# Conflict rule 6: source branch must match the release type semantics.
-#   rc    -> develop (release-candidate of a milestone in progress)
-#   final -> main    (post develop->main merge; the released line)
-# alpha allows any source branch (the input is the dispatch flag itself, no
-# semantic constraint). Fail fast on mismatch instead of silently overriding
-# the user's input.
-assert_source_branch_matches_release_type() {
-    local release_type="$1" in_branch="$2"
+# Conflict rule 6: final dispatches must run with the workflow ref pointing
+# at refs/heads/main. This enforces the develop->main merge ceremony for
+# user-facing releases. Alpha and rc are not constrained — they can dispatch
+# from any branch (useful for feature-branch builds and pre-release testing).
+#
+# The tag created by softprops/action-gh-release lands on the workflow's
+# commit, which is GITHUB_REF's HEAD at checkout time. So enforcing the
+# workflow ref also constrains where the v9.x.0 tag lands.
+assert_workflow_ref_is_main_for_final() {
+    local release_type="$1" workflow_ref="$2"
+    if [ "$release_type" = "final" ] && [ "$workflow_ref" != "refs/heads/main" ]; then
+        err "Final dispatches must run with the workflow ref set to refs/heads/main. Got '${workflow_ref}'. Merge develop->main first, then re-dispatch via: gh workflow run build-installer.yml --ref main -f release_type=final."
+        return 2
+    fi
+}
+
+# Soft convention warning: the dependency_branch input is unconventional for
+# an rc or final build. The convention is 'develop' (a workflow-level value;
+# not derived per-dep). Surfaces as a ::warning:: annotation in the run log
+# and is also visible in the release body's provenance section.
+#
+# Alpha dispatches are intentionally NOT warned — alphas are flexible by
+# design (e.g. multi-repo feature-branch builds).
+warn_non_conventional_dependency_branch() {
+    local release_type="$1" dep_branch="$2"
+    local expected="develop"
     case "$release_type" in
-        rc)
-            if [ -n "$in_branch" ] && [ "$in_branch" != "develop" ]; then
-                err "RC dispatches must build from develop. Got source_branch='$in_branch'. Re-dispatch with source_branch=develop (or leave it empty), or use release_type=alpha to build from '$in_branch'."
-                return 2
-            fi
-            ;;
-        final)
-            if [ -n "$in_branch" ] && [ "$in_branch" != "main" ]; then
-                err "Final dispatches must build from main. Got source_branch='$in_branch'. Merge develop->main first, then re-dispatch with source_branch=main (or leave it empty)."
-                return 2
+        rc|final)
+            if [ -n "$dep_branch" ] && [ "$dep_branch" != "$expected" ]; then
+                printf '::warning title=Non-conventional dependency_branch::Building %s with dependency_branch=%s; convention is %s. Confirm intent before publishing.\n' \
+                    "$release_type" "$dep_branch" "$expected" >&2
             fi
             ;;
     esac
@@ -177,9 +196,9 @@ assert_source_branch_matches_release_type() {
 # to stdout (intended to be appended to $GITHUB_OUTPUT).
 resolve_main() {
     local event="${GITHUB_EVENT_NAME:-}"
-    local ref="${GITHUB_REF_NAME:-}"
+    local workflow_ref="${GITHUB_REF:-}"
     local in_type="${INPUT_RELEASE_TYPE:-}"
-    local in_branch="${INPUT_SOURCE_BRANCH:-}"
+    local in_dep_branch="${INPUT_DEPENDENCY_BRANCH:-}"
 
     local wixproj="${WIXPROJ_PATH:-BHoM_Installer/BHoM_Installer.wixproj}"
     local mn; mn=$(read_wixproj_version "$wixproj") || return 3
@@ -187,13 +206,13 @@ resolve_main() {
 
     local today="${TODAY_OVERRIDE:-$(date -u +%y%m%d)}"
 
-    local release_type source_branch prerelease make_latest release_tag msi_patch_version=""
+    local release_type dependency_branch prerelease make_latest release_tag msi_patch_version=""
     local should_publish=true
 
     case "$event" in
         schedule)
             release_type=alpha
-            source_branch=develop
+            dependency_branch=develop
             prerelease=true
             make_latest=false
             # Rule 3 is SOFT for scheduled nightlies: if v{M}.{N}.0 has already
@@ -213,9 +232,14 @@ resolve_main() {
 
         workflow_dispatch)
             release_type="${in_type:-alpha}"
+            # dependency_branch defaults to 'develop' when input is empty.
+            # The value flows through to Build-Installer.ps1 as the try-first
+            # branch on each dep clone; missing branches fall back to each
+            # dep's actual default branch.
+            dependency_branch="${in_dep_branch:-develop}"
+
             case "$release_type" in
                 alpha)
-                    source_branch="${in_branch:-develop}"
                     assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
                     release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
                     # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
@@ -223,9 +247,7 @@ resolve_main() {
                     make_latest=false
                     ;;
                 rc)
-                    assert_source_branch_matches_release_type rc "$in_branch" || return 2
-                    # RC dispatch always builds from develop regardless of input.
-                    source_branch=develop
+                    warn_non_conventional_dependency_branch rc "$dependency_branch"
                     assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
                     release_tag=$(compute_rc_tag "$wix_m" "$wix_n")
                     # MSI PatchVersion = the RC counter (e.g. v9.2.0-rc.3 -> 3).
@@ -234,9 +256,8 @@ resolve_main() {
                     make_latest=false
                     ;;
                 final)
-                    assert_source_branch_matches_release_type final "$in_branch" || return 2
-                    # Final dispatch always builds from main regardless of input.
-                    source_branch=main
+                    assert_workflow_ref_is_main_for_final final "$workflow_ref" || return 2
+                    warn_non_conventional_dependency_branch final "$dependency_branch"
                     release_tag=$(derive_final_tag "$wix_m" "$wix_n")
                     assert_release_not_already_published "$release_tag" || return 2
                     # MSI PatchVersion = 0 under the no-patches model.
@@ -258,7 +279,7 @@ resolve_main() {
     esac
 
     printf 'release_type=%s\n'      "$release_type"
-    printf 'source_branch=%s\n'     "$source_branch"
+    printf 'dependency_branch=%s\n' "$dependency_branch"
     printf 'prerelease=%s\n'        "$prerelease"
     printf 'make_latest=%s\n'       "$make_latest"
     printf 'release_tag=%s\n'       "$release_tag"
@@ -373,7 +394,6 @@ EOF
     }
 
     # ── derive_final_tag ──
-    # Final tag is always vM.N.0 derived from the wixproj.
 
     assert_equal "final tag from wixproj 9.2"  "v9.2.0"  "$(derive_final_tag 9 2)"
     assert_equal "final tag from wixproj 10.0" "v10.0.0" "$(derive_final_tag 10 0)"
@@ -407,6 +427,50 @@ EOF
             --jq '.[].tag_name'
     }
 
+    # ── assert_workflow_ref_is_main_for_final ──
+
+    assert_equal "rule 6: final + ref=refs/heads/main passes" "ok" \
+        "$(assert_workflow_ref_is_main_for_final final refs/heads/main >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "rule 6: final + ref=refs/heads/develop fails" "fail" \
+        "$(assert_workflow_ref_is_main_for_final final refs/heads/develop >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "rule 6: final + ref=refs/heads/feature/x fails" "fail" \
+        "$(assert_workflow_ref_is_main_for_final final refs/heads/feature/x >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "rule 6: final + ref=refs/tags/v9.2.0 fails" "fail" \
+        "$(assert_workflow_ref_is_main_for_final final refs/tags/v9.2.0 >/dev/null 2>&1 && echo ok || echo fail)"
+
+    # alpha and rc are not constrained by the ref check
+    assert_equal "rule 6: alpha + ref=refs/heads/feature/x passes" "ok" \
+        "$(assert_workflow_ref_is_main_for_final alpha refs/heads/feature/x >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "rule 6: rc + ref=refs/heads/feature/x passes" "ok" \
+        "$(assert_workflow_ref_is_main_for_final rc refs/heads/feature/x >/dev/null 2>&1 && echo ok || echo fail)"
+
+    # ── warn_non_conventional_dependency_branch ──
+    # Soft warning: returns 0 always, but emits ::warning:: to stderr when
+    # release_type is rc/final AND dep_branch is non-conventional.
+
+    assert_equal "warn: rc + dep_branch=develop is silent" "" \
+        "$(warn_non_conventional_dependency_branch rc develop 2>&1)"
+
+    assert_equal "warn: rc + dep_branch=main emits warning" "warning" \
+        "$(warn_non_conventional_dependency_branch rc main 2>&1 | grep -oE '^::warning' | head -1 | tr -d ':')"
+
+    assert_equal "warn: final + dep_branch=develop is silent" "" \
+        "$(warn_non_conventional_dependency_branch final develop 2>&1)"
+
+    assert_equal "warn: final + dep_branch=feature/x emits warning" "warning" \
+        "$(warn_non_conventional_dependency_branch final feature/x 2>&1 | grep -oE '^::warning' | head -1 | tr -d ':')"
+
+    # alpha never warns regardless of dep_branch
+    assert_equal "warn: alpha + dep_branch=main is silent" "" \
+        "$(warn_non_conventional_dependency_branch alpha main 2>&1)"
+
+    assert_equal "warn: alpha + dep_branch=feature/x is silent" "" \
+        "$(warn_non_conventional_dependency_branch alpha feature/x 2>&1)"
+
     # ── resolve_main integration ──
     # Drive resolve_main via env vars and capture stdout. Override
     # lookup_tags/lookup_releases per case.
@@ -422,68 +486,69 @@ EOF
     export TODAY_OVERRIDE="260605"
 
     # Schedule -> alpha pre-release for today.
-    export GITHUB_EVENT_NAME=schedule GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE="" INPUT_DEPENDENCY_BRANCH=""
     local out; out=$(lookup_tags()    { :; }; \
                      lookup_releases(){ :; }; \
                      resolve_main 2>/dev/null)
-    assert_equal "schedule -> release_type=alpha"     "alpha"                "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
-    assert_equal "schedule -> source_branch=develop"  "develop"              "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
-    assert_equal "schedule -> prerelease=true"        "true"                 "$(echo "$out" | grep '^prerelease='    | cut -d= -f2)"
-    assert_equal "schedule -> make_latest=false"      "false"                "$(echo "$out" | grep '^make_latest='   | cut -d= -f2)"
-    assert_equal "schedule -> release_tag computed"   "v9.2.0-alpha.260605"  "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
+    assert_equal "schedule -> release_type=alpha"     "alpha"                "$(echo "$out" | grep '^release_type='      | cut -d= -f2)"
+    assert_equal "schedule -> dependency_branch=develop"  "develop"          "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
+    assert_equal "schedule -> prerelease=true"        "true"                 "$(echo "$out" | grep '^prerelease='        | cut -d= -f2)"
+    assert_equal "schedule -> make_latest=false"      "false"                "$(echo "$out" | grep '^make_latest='       | cut -d= -f2)"
+    assert_equal "schedule -> release_tag computed"   "v9.2.0-alpha.260605"  "$(echo "$out" | grep '^release_tag='       | cut -d= -f2)"
 
-    # workflow_dispatch rc -> rc pre-release.
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE=rc INPUT_SOURCE_BRANCH=develop
+    # workflow_dispatch rc -> rc pre-release. Convention path: dependency_branch=develop.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=rc INPUT_DEPENDENCY_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "dispatch rc -> release_type=rc"          "rc"              "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
-    assert_equal "dispatch rc -> source_branch=develop"    "develop"         "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
-    assert_equal "dispatch rc -> tag=v9.2.0-rc.1"          "v9.2.0-rc.1"     "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
+    assert_equal "dispatch rc -> release_type=rc"              "rc"          "$(echo "$out" | grep '^release_type='      | cut -d= -f2)"
+    assert_equal "dispatch rc -> dependency_branch=develop"    "develop"     "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
+    assert_equal "dispatch rc -> tag=v9.2.0-rc.1"              "v9.2.0-rc.1" "$(echo "$out" | grep '^release_tag='       | cut -d= -f2)"
 
-    # workflow_dispatch alpha with source_branch.
-    export GITHUB_EVENT_NAME=workflow_dispatch \
-        INPUT_RELEASE_TYPE=alpha INPUT_SOURCE_BRANCH=feature/foo
+    # workflow_dispatch alpha with dependency_branch passes through unchanged.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=alpha INPUT_DEPENDENCY_BRANCH=feature/foo
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "dispatch alpha source_branch passes through" "feature/foo" \
-        "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
+    assert_equal "dispatch alpha dependency_branch passes through" "feature/foo" \
+        "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
 
-    # workflow_dispatch final -> final release.
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=main \
-        INPUT_RELEASE_TYPE=final INPUT_SOURCE_BRANCH=main
+    # workflow_dispatch final from main with conventional dep_branch.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
+        INPUT_RELEASE_TYPE=final INPUT_DEPENDENCY_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "dispatch final -> release_type=final" "final"  "$(echo "$out" | grep '^release_type='  | cut -d= -f2)"
-    assert_equal "dispatch final -> source_branch=main" "main"   "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
-    assert_equal "dispatch final -> prerelease=false"   "false"  "$(echo "$out" | grep '^prerelease='    | cut -d= -f2)"
-    assert_equal "dispatch final -> make_latest=true"   "true"   "$(echo "$out" | grep '^make_latest='   | cut -d= -f2)"
-    assert_equal "dispatch final -> tag=v9.2.0"         "v9.2.0" "$(echo "$out" | grep '^release_tag='   | cut -d= -f2)"
-    assert_equal "dispatch final -> msi_patch=0"        "0"      "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
+    assert_equal "dispatch final -> release_type=final"        "final"   "$(echo "$out" | grep '^release_type='      | cut -d= -f2)"
+    assert_equal "dispatch final -> dependency_branch=develop" "develop" "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
+    assert_equal "dispatch final -> prerelease=false"          "false"   "$(echo "$out" | grep '^prerelease='        | cut -d= -f2)"
+    assert_equal "dispatch final -> make_latest=true"          "true"    "$(echo "$out" | grep '^make_latest='       | cut -d= -f2)"
+    assert_equal "dispatch final -> tag=v9.2.0"                "v9.2.0"  "$(echo "$out" | grep '^release_tag='       | cut -d= -f2)"
+    assert_equal "dispatch final -> msi_patch=0"               "0"       "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
-    # workflow_dispatch final with empty source_branch -> succeeds (defaults to main).
-    export INPUT_SOURCE_BRANCH=""
+    # workflow_dispatch final with empty INPUT_DEPENDENCY_BRANCH defaults to develop.
+    export INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "dispatch final + empty source -> source=main" "main" \
-        "$(echo "$out" | grep '^source_branch=' | cut -d= -f2)"
+    assert_equal "dispatch final + empty dep_branch -> dependency_branch=develop" "develop" \
+        "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
 
-    # workflow_dispatch rc -> msi_patch equals the counter.
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE=rc INPUT_SOURCE_BRANCH=""
+    # workflow_dispatch rc msi_patch equals the counter.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=rc INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { printf '%s\n' "v9.2.0-rc.1" "v9.2.0-rc.2"; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
     assert_equal "rc dispatch -> msi_patch=3 (next counter)" "3" \
         "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
-    # workflow_dispatch alpha -> msi_patch empty (Build-Installer.ps1 defaults to yyMMdd).
-    export GITHUB_EVENT_NAME=workflow_dispatch INPUT_RELEASE_TYPE=alpha
+    # workflow_dispatch alpha msi_patch empty (Build-Installer.ps1 defaults to yyMMdd).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=alpha INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
@@ -491,8 +556,8 @@ EOF
         "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
     # dispatch final when v9.2.0 already published -> rule 4 fires.
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=main \
-        INPUT_RELEASE_TYPE=final INPUT_SOURCE_BRANCH=main
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
+        INPUT_RELEASE_TYPE=final INPUT_DEPENDENCY_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
@@ -501,31 +566,84 @@ EOF
         *) assert_equal "rule 4 trips on final dispatch when already published" "ok" "got: $out" ;;
     esac
 
-    # dispatch final from develop -> rule 6 fires.
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=main \
-        INPUT_RELEASE_TYPE=final INPUT_SOURCE_BRANCH=develop
+    # dispatch final from develop ref -> rule 6 fires (hard).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=final INPUT_DEPENDENCY_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"Final dispatches must build from main"*"exit=2") assert_equal "rule 6: final + develop fails" "ok" "ok" ;;
-        *) assert_equal "rule 6: final + develop fails" "ok" "got: $out" ;;
+        *"Final dispatches must run with the workflow ref"*"exit=2") assert_equal "rule 6: final + ref=develop fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: final + ref=develop fails" "ok" "got: $out" ;;
     esac
 
-    # dispatch final from feature branch -> rule 6 fires.
-    export INPUT_SOURCE_BRANCH=feature/X
+    # dispatch final from feature branch ref -> rule 6 fires.
+    export GITHUB_REF=refs/heads/feature/X
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"Final dispatches must build from main"*"exit=2") assert_equal "rule 6: final + feature/X fails" "ok" "ok" ;;
-        *) assert_equal "rule 6: final + feature/X fails" "ok" "got: $out" ;;
+        *"Final dispatches must run with the workflow ref"*"exit=2") assert_equal "rule 6: final + ref=feature/X fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: final + ref=feature/X fails" "ok" "got: $out" ;;
     esac
 
-    # schedule when v9.2.0 already shipped -> rule 3 SOFT: should_publish=false,
-    # no error exit, warning emitted to stderr.
-    export GITHUB_EVENT_NAME=schedule GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    # dispatch final from tag ref -> rule 6 fires.
+    export GITHUB_REF=refs/tags/v9.2.0
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$out" in
+        *"Final dispatches must run with the workflow ref"*"exit=2") assert_equal "rule 6: final + ref=refs/tags/v9.2.0 fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: final + ref=refs/tags/v9.2.0 fails" "ok" "got: $out" ;;
+    esac
+
+    # dispatch rc with dep_branch=main -> succeeds with warning.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=rc INPUT_DEPENDENCY_BRANCH=main
+    local stderr_out
+    stderr_out=$(lookup_tags()    { :; }; \
+                 lookup_releases(){ :; }; \
+                 resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$stderr_out" in
+        *"Non-conventional dependency_branch"*"exit=0") assert_equal "rc + dep_branch=main warns but succeeds" "ok" "ok" ;;
+        *) assert_equal "rc + dep_branch=main warns but succeeds" "ok" "got: $stderr_out" ;;
+    esac
+
+    # dispatch rc with dep_branch=feature/X -> succeeds with warning.
+    export INPUT_DEPENDENCY_BRANCH=feature/X
+    stderr_out=$(lookup_tags()    { :; }; \
+                 lookup_releases(){ :; }; \
+                 resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$stderr_out" in
+        *"Non-conventional dependency_branch"*"exit=0") assert_equal "rc + dep_branch=feature/X warns but succeeds" "ok" "ok" ;;
+        *) assert_equal "rc + dep_branch=feature/X warns but succeeds" "ok" "got: $stderr_out" ;;
+    esac
+
+    # dispatch final with dep_branch=main -> succeeds with warning (ref=main).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
+        INPUT_RELEASE_TYPE=final INPUT_DEPENDENCY_BRANCH=main
+    stderr_out=$(lookup_tags()    { :; }; \
+                 lookup_releases(){ :; }; \
+                 resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$stderr_out" in
+        *"Non-conventional dependency_branch"*"exit=0") assert_equal "final + dep_branch=main warns but succeeds" "ok" "ok" ;;
+        *) assert_equal "final + dep_branch=main warns but succeeds" "ok" "got: $stderr_out" ;;
+    esac
+
+    # alpha with non-conventional dep_branch -> no warning (alphas are flexible).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=alpha INPUT_DEPENDENCY_BRANCH=main
+    stderr_out=$(lookup_tags()    { :; }; \
+                 lookup_releases(){ :; }; \
+                 resolve_main 2>&1 >/dev/null)
+    case "$stderr_out" in
+        *"Non-conventional dependency_branch"*) assert_equal "alpha + dep_branch=main does NOT warn" "ok" "WARNED (unexpected)" ;;
+        *) assert_equal "alpha + dep_branch=main does NOT warn" "ok" "ok" ;;
+    esac
+
+    # schedule when v9.2.0 already shipped -> rule 3 SOFT: should_publish=false.
+    export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE="" INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
           resolve_main 2>/dev/null)
@@ -537,6 +655,7 @@ EOF
         "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
 
     # And the warning is on stderr; the exit code is 0 (soft, not hard).
+    local err_out
     err_out=$(lookup_tags()    { :; }; \
               lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
               resolve_main 2>&1 >/dev/null; echo "exit=$?")
@@ -546,8 +665,8 @@ EOF
     esac
 
     # Dispatched alpha when v9.2.0 shipped -> rule 3 HARD (user explicit).
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE=alpha INPUT_SOURCE_BRANCH=""
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=alpha INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0"; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
@@ -557,8 +676,8 @@ EOF
     esac
 
     # Default schedule (no shipped release) -> should_publish=true.
-    export GITHUB_EVENT_NAME=schedule GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE="" INPUT_SOURCE_BRANCH=""
+    export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE="" INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
@@ -567,37 +686,26 @@ EOF
     assert_equal "schedule -> wix_major=9 wix_minor=2 surfaced" "9 2" \
         "$(echo "$out" | grep -E '^wix_(major|minor)=' | cut -d= -f2 | xargs)"
 
-    # Rule 6: rc dispatch with feature branch -> exit 2
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=develop \
-        INPUT_RELEASE_TYPE=rc INPUT_SOURCE_BRANCH=feature/X
-    out=$(lookup_tags()    { :; }; \
-          lookup_releases(){ :; }; \
-          resolve_main 2>&1 >/dev/null; echo "exit=$?")
-    case "$out" in
-        *"RC dispatches must build from develop"*"exit=2") assert_equal "rule 6: rc + feature/X fails" "ok" "ok" ;;
-        *) assert_equal "rule 6: rc + feature/X fails" "ok" "got: $out" ;;
-    esac
-
-    # Rule 6: rc dispatch with main -> exit 2
-    export INPUT_SOURCE_BRANCH=main
-    out=$(lookup_tags()    { :; }; \
-          lookup_releases(){ :; }; \
-          resolve_main 2>&1 >/dev/null; echo "exit=$?")
-    case "$out" in
-        *"RC dispatches must build from develop"*"exit=2") assert_equal "rule 6: rc + main fails" "ok" "ok" ;;
-        *) assert_equal "rule 6: rc + main fails" "ok" "got: $out" ;;
-    esac
-
-    # Rule 6: rc dispatch with empty source_branch -> succeeds
-    export INPUT_SOURCE_BRANCH=""
+    # Alpha dispatched from any branch ref (no constraint).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/feature/X \
+        INPUT_RELEASE_TYPE=alpha INPUT_DEPENDENCY_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "rule 6: rc + empty source_branch succeeds" "rc" \
+    assert_equal "alpha + ref=feature/X succeeds" "alpha" \
+        "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
+
+    # RC dispatched from any branch ref (no constraint).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
+        INPUT_RELEASE_TYPE=rc INPUT_DEPENDENCY_BRANCH=develop
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "rc + ref=main succeeds (no hard rule)" "rc" \
         "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
 
     rm -f "$wixproj_tmp"
-    unset WIXPROJ_PATH TODAY_OVERRIDE GITHUB_EVENT_NAME GITHUB_REF_NAME INPUT_RELEASE_TYPE INPUT_SOURCE_BRANCH
+    unset WIXPROJ_PATH TODAY_OVERRIDE GITHUB_EVENT_NAME GITHUB_REF INPUT_RELEASE_TYPE INPUT_DEPENDENCY_BRANCH
 
     echo
     echo "Results: $pass passed, $fail failed"

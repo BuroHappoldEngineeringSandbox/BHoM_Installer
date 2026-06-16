@@ -34,9 +34,12 @@
     BHoM_Installer. For BHE builds this would be BuroHappold_Installer (not yet
     supported in this iteration).
 
-.PARAMETER MainBranch
-    Branch to clone each dep from. Defaults to 'develop' (matches BHoMBot's
-    DevelopBranchName for alpha builds).
+.PARAMETER DependencyBranch
+    Branch to try first on each dependency repo clone. Falls back to each
+    dep's actual default branch (the GitHub default, whatever that is)
+    when the requested branch is not present.
+    Defaults to 'develop'. Pass an empty string to skip the try-first step
+    entirely and clone each dep at its own default branch.
 #>
 
 [CmdletBinding()]
@@ -51,7 +54,7 @@ param(
 
     [string]$InstallerRepoName = 'BHoM_Installer',
 
-    [string]$MainBranch = 'develop'
+    [string]$DependencyBranch = 'develop'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -80,11 +83,11 @@ if (-not (Test-Path $installerRoot)) { throw "Installer repo not found at: $inst
 if (-not (Test-Path $manifestDir))   { throw "Manifest directory not found at: $manifestDir" }
 
 Write-Host "::group::Build configuration"
-Write-Host "ReleaseType:    $ReleaseType"
-Write-Host "PatchVersion:   $PatchVersion"
-Write-Host "MainBranch:     $MainBranch"
-Write-Host "CodeLocation:   $CodeLocation"
-Write-Host "InstallerRoot:  $installerRoot"
+Write-Host "ReleaseType:       $ReleaseType"
+Write-Host "PatchVersion:      $PatchVersion"
+Write-Host "DependencyBranch:  $DependencyBranch"
+Write-Host "CodeLocation:      $CodeLocation"
+Write-Host "InstallerRoot:     $installerRoot"
 Write-Host "::endgroup::"
 
 # Ensure the BHoM ProgramData directories exist. Each dep repo's PostBuildEvent
@@ -123,17 +126,18 @@ function Clone-Repo {
         return $target
     }
 
-    # --depth 1 keeps the runner fast; we don't need history for builds.
-    # --branch $MainBranch ensures we land on develop (matches BHoMBot's
-    # DevelopBranchName for alpha builds). If the branch does not exist on
-    # a dep, the clone is allowed to fail loudly so the issue is visible,
-    # rather than silently falling back to the default branch.
-    git clone --depth 1 --branch $MainBranch "https://github.com/$OrgRepo.git" $target 2>&1 | ForEach-Object { Write-Host "  $_" }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "::warning::Branch '$MainBranch' not found on $OrgRepo. Falling back to repository default branch."
-        git clone --depth 1 "https://github.com/$OrgRepo.git" $target 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -ne 0) { throw "git clone failed for $OrgRepo" }
+    # Two-step clone: try the requested DependencyBranch first; on failure
+    # (branch absent on this dep), fall back to that dep's actual GitHub
+    # default branch by cloning without --branch. When DependencyBranch is
+    # empty, skip the try-first step and go straight to the default-branch
+    # clone (workflow passes empty when no specific branch is requested).
+    if ($DependencyBranch) {
+        git clone --depth 1 --branch $DependencyBranch "https://github.com/$OrgRepo.git" $target 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -eq 0) { return $target }
+        Write-Host "::warning::Branch '$DependencyBranch' not found on $OrgRepo. Falling back to repository default branch."
     }
+    git clone --depth 1 "https://github.com/$OrgRepo.git" $target 2>&1 | ForEach-Object { Write-Host "  $_" }
+    if ($LASTEXITCODE -ne 0) { throw "git clone failed for $OrgRepo" }
     return $target
 }
 

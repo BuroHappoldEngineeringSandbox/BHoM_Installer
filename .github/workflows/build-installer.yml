@@ -1,21 +1,24 @@
 # Build Installer. GitHub Actions replacement for BHoMBot's 00:45 UTC alpha build.
 #
-# Triggers and the release flavours they produce (all parameters resolved by
-# the 'resolve' job below):
+# Three-input model (see proposal.md Section 6):
+#   1. Installer branch  : "Use workflow from Branch" (GHA's --ref). The
+#                          installer repo is checked out at this ref and
+#                          the resulting release tag lands on this branch's
+#                          HEAD. Hard rule: final dispatches must use main.
+#   2. Release type      : workflow_dispatch input. alpha | rc | final.
+#   3. Dependency branch : workflow_dispatch input. The branch tried on
+#                          each dep clone; falls back to that dep's own
+#                          default branch if absent. Convention is 'develop'
+#                          for rc/final; non-conventional values surface a
+#                          warning but are not blocked.
 #
-#   schedule            Nightly alpha. Fires 00:45 UTC on the default branch
-#                       only. release_type=alpha, prerelease=true.
+# Triggers and the release flavours they produce:
 #
-#   workflow_dispatch   Manual run. The 'release_type' input chooses:
-#                         alpha — pre-release from any branch (default develop).
-#                                 release_type=alpha, prerelease=true.
-#                         rc    — release candidate from develop (during freeze).
-#                                 release_type=rc, prerelease=true.
-#                         final — finalised release from main (post develop->main
-#                                 merge). release_type=final, prerelease=false,
-#                                 marked as Latest. The tag (vM.N.0 derived from
-#                                 BHoM_Installer.wixproj) is created by this
-#                                 workflow at the built commit; no manual push.
+#   schedule            Nightly alpha. Fires 00:45 UTC on the default branch.
+#                       release_type=alpha, dependency_branch=develop,
+#                       prerelease=true.
+#
+#   workflow_dispatch   Manual run, fully parameterised. See input docs below.
 
 name: Build Installer
 
@@ -24,24 +27,33 @@ on:
     inputs:
       release_type:
         description: |
-          alpha — alpha pre-release. Tag: vM.N.0-alpha.YYMMDD[.counter]
-          rc    — release candidate (use during feature-freeze QA). Source must
-                  be develop. Tag: vM.N.0-rc.counter
-          final — finalised release. Source must be main (post develop->main
-                  merge). Tag: vM.N.0 derived from BHoM_Installer.wixproj.
+          alpha — pre-release. Tag: vM.N.0-alpha.YYMMDD[.counter]. May be
+                  dispatched from any installer-repo branch.
+          rc    — release candidate (use during feature-freeze QA). Tag:
+                  vM.N.0-rc.counter. May be dispatched from any installer-repo
+                  branch. dependency_branch convention is develop (warning if not).
+          final — finalised release. Tag: vM.N.0 derived from BHoM_Installer.wixproj.
                   Marked Latest on the Releases page; prerelease=false.
+                  MUST be dispatched with "Use workflow from Branch" set to main
+                  (the workflow rejects any other ref). dependency_branch
+                  convention is develop (warning if not).
         type: choice
         options:
           - alpha
           - rc
           - final
         default: alpha
-      source_branch:
+      dependency_branch:
         description: |
-          Branch to build from. Default 'develop'.
-          Alpha-only: useful for testing a feature branch across deps that
-          share the branch name. Deps without the branch fall back to their
-          default branch. Beta ignores this input and always uses 'develop'.
+          Branch to try first on every dep repo clone. Falls back to each
+          dep's own default branch when the requested branch is not present
+          (most BHoM deps have develop as default).
+          Default 'develop' for all release types.
+          Useful for testing a feature branch across deps that share the
+          branch name (alpha workflow).
+          For rc and final dispatches: convention is develop; a non-conventional
+          value surfaces a warning in the run log and release body but is not
+          rejected.
         type: string
         required: false
         default: 'develop'
@@ -66,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_type:      ${{ steps.r.outputs.release_type }}
-      source_branch:     ${{ steps.r.outputs.source_branch }}
+      dependency_branch: ${{ steps.r.outputs.dependency_branch }}
       prerelease:        ${{ steps.r.outputs.prerelease }}
       make_latest:       ${{ steps.r.outputs.make_latest }}
       release_tag:       ${{ steps.r.outputs.release_tag }}
@@ -74,6 +86,7 @@ jobs:
       should_publish:    ${{ steps.r.outputs.should_publish }}
       wix_major:         ${{ steps.r.outputs.wix_major }}
       wix_minor:         ${{ steps.r.outputs.wix_minor }}
+      installer_ref:     ${{ steps.r.outputs.installer_ref }}
     steps:
       - name: Checkout (sparse) for the wixproj and resolve script
         uses: actions/checkout@v4
@@ -88,13 +101,18 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_RELEASE_TYPE:  ${{ inputs.release_type }}
-          INPUT_SOURCE_BRANCH: ${{ inputs.source_branch }}
+          # GITHUB_REF is set by GHA automatically; the resolve script reads
+          # it as the workflow-ref input (rule 6: final must equal refs/heads/main).
+          INPUT_RELEASE_TYPE:      ${{ inputs.release_type }}
+          INPUT_DEPENDENCY_BRANCH: ${{ inputs.dependency_branch }}
         run: |
           set -euo pipefail
           bash scripts/resolve-release-tag.sh >> "$GITHUB_OUTPUT"
+          # Echo github.ref_name as an explicit output for downstream jobs that
+          # want to surface "Installer branch" in release-body provenance.
+          echo "installer_ref=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           echo "::notice::Resolved parameters:"
-          grep -E '^(release_type|source_branch|prerelease|make_latest|release_tag|msi_patch_version|should_publish|wix_major|wix_minor)=' "$GITHUB_OUTPUT"
+          grep -E '^(release_type|dependency_branch|prerelease|make_latest|release_tag|msi_patch_version|should_publish|wix_major|wix_minor|installer_ref)=' "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ needs.resolve.outputs.release_type }} installer
@@ -196,31 +214,35 @@ jobs:
         env:
           RELEASE_TYPE:      ${{ needs.resolve.outputs.release_type }}
           MSI_PATCH_VERSION: ${{ needs.resolve.outputs.msi_patch_version }}
-          SOURCE_BRANCH:     ${{ needs.resolve.outputs.source_branch }}
+          DEPENDENCY_BRANCH: ${{ needs.resolve.outputs.dependency_branch }}
         run: |
           # Hashtable splat (not array) so PowerShell binds by parameter name.
           # Array splatting would otherwise treat '-ReleaseType' as a value.
           $splat = @{
-              ReleaseType = $env:RELEASE_TYPE
-              MainBranch  = $env:SOURCE_BRANCH
+              ReleaseType       = $env:RELEASE_TYPE
+              DependencyBranch  = $env:DEPENDENCY_BRANCH
           }
           # Only forward MSI_PATCH_VERSION when resolve emitted one. Alpha
           # leaves it blank so Build-Installer.ps1 falls through to its yyMMdd
-          # default (line 68-70). RC pre-release and final-release flavours
-          # set it explicitly so the MSI filename matches the release tag.
+          # default. RC and final flavours set it explicitly so the MSI
+          # filename matches the release tag.
           if ($env:MSI_PATCH_VERSION) { $splat['PatchVersion'] = $env:MSI_PATCH_VERSION }
 
           & "$env:GITHUB_WORKSPACE\scripts\Build-Installer.ps1" @splat
 
       - name: Generate dep manifest (for release-note diffing)
         # Walk the cloned dep repos that sit alongside the installer checkout
-        # and record each one's (org/repo, branch, current tip SHA). The
-        # publish-alpha job downloads the previous release's copy of this file
-        # and diffs it against this one to render "what changed since last build"
-        # release notes.
+        # and record each one's (org/repo, current tip SHA). The publish job
+        # downloads the previous release's copy of this file and diffs it
+        # against this one to render "what changed since last build" notes.
+        #
+        # The recorded `branch` field is what was REQUESTED (the dependency_branch
+        # input). Each dep's actual cloned branch may differ if it fell back to
+        # the dep's default — that information lives in the dep repo itself.
         env:
-          RELEASE_TYPE: ${{ needs.resolve.outputs.release_type }}
-          SOURCE_BRANCH:  ${{ needs.resolve.outputs.source_branch }}
+          RELEASE_TYPE:      ${{ needs.resolve.outputs.release_type }}
+          DEPENDENCY_BRANCH: ${{ needs.resolve.outputs.dependency_branch }}
+          INSTALLER_REF:     ${{ needs.resolve.outputs.installer_ref }}
         run: |
           $depsObject = [ordered]@{}
           Get-ChildItem 'D:\a\BHoM_Installer' -Directory -ErrorAction SilentlyContinue |
@@ -232,17 +254,18 @@ jobs:
                       $orgRepo = "$($Matches[1])/$($Matches[2])"
                       $sha = (git -C $_.FullName rev-parse HEAD 2>$null).Trim()
                       if ($sha) {
-                          $depsObject[$orgRepo] = [ordered]@{ branch = $env:SOURCE_BRANCH; sha = $sha }
+                          $depsObject[$orgRepo] = [ordered]@{ branch = $env:DEPENDENCY_BRANCH; sha = $sha }
                       }
                   }
               }
 
           $manifest = [ordered]@{
-              version       = 1
-              built_at      = (Get-Date).ToUniversalTime().ToString('o')
-              release_type  = $env:RELEASE_TYPE
-              source_branch = $env:SOURCE_BRANCH
-              deps          = $depsObject
+              version           = 1
+              built_at          = (Get-Date).ToUniversalTime().ToString('o')
+              release_type      = $env:RELEASE_TYPE
+              installer_branch  = $env:INSTALLER_REF
+              dependency_branch = $env:DEPENDENCY_BRANCH
+              deps              = $depsObject
           }
 
           $outPath = Join-Path $env:GITHUB_WORKSPACE 'Build\dep-manifest.json'
@@ -502,15 +525,15 @@ jobs:
 
       - name: Download anchor's dep-manifest
         id: prev-manifest
-        # Diff section renders for canonical-source builds only:
-        #   alpha / rc -> source_branch=develop
-        #   final      -> source_branch=main
+        # Diff section renders for canonical installer-ref builds only:
+        #   alpha / rc -> installer_ref=develop
+        #   final      -> installer_ref=main (hard rule enforced at resolve)
         # Non-canonical dispatches (typically alpha-from-feature-branch) skip
         # the download; compose-release-body.sh renders a warning block instead.
         if: |
           steps.anchor.outputs.anchor_kind == 'stable' && (
-            needs.resolve.outputs.source_branch == 'develop' ||
-            (needs.resolve.outputs.source_branch == 'main' && needs.resolve.outputs.release_type == 'final')
+            (needs.resolve.outputs.installer_ref == 'develop' && needs.resolve.outputs.release_type != 'final') ||
+            (needs.resolve.outputs.installer_ref == 'main' && needs.resolve.outputs.release_type == 'final')
           )
         env:
           GH_TOKEN: ${{ github.token }}
@@ -532,8 +555,8 @@ jobs:
       - name: Generate dep-change release-notes section
         if: |
           steps.anchor.outputs.anchor_kind == 'stable' && steps.prev-manifest.outputs.path != '' && (
-            needs.resolve.outputs.source_branch == 'develop' ||
-            (needs.resolve.outputs.source_branch == 'main' && needs.resolve.outputs.release_type == 'final')
+            (needs.resolve.outputs.installer_ref == 'develop' && needs.resolve.outputs.release_type != 'final') ||
+            (needs.resolve.outputs.installer_ref == 'main' && needs.resolve.outputs.release_type == 'final')
           )
         env:
           GH_TOKEN: ${{ github.token }}
@@ -554,11 +577,12 @@ jobs:
 
       - name: Compose full release body
         env:
-          GH_TOKEN:      ${{ github.token }}
-          SOURCE_BRANCH: ${{ needs.resolve.outputs.source_branch }}
-          RELEASE_TYPE:  ${{ needs.resolve.outputs.release_type }}
-          IS_PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
-          BUILT_AT:      ${{ steps.built-at.outputs.value }}
+          GH_TOKEN:           ${{ github.token }}
+          INSTALLER_REF:      ${{ needs.resolve.outputs.installer_ref }}
+          DEPENDENCY_BRANCH:  ${{ needs.resolve.outputs.dependency_branch }}
+          RELEASE_TYPE:       ${{ needs.resolve.outputs.release_type }}
+          IS_PRERELEASE:      ${{ needs.resolve.outputs.prerelease }}
+          BUILT_AT:           ${{ steps.built-at.outputs.value }}
         run: bash scripts/compose-release-body.sh
 
       - name: Publish release
