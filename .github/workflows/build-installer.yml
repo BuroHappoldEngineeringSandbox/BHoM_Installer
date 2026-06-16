@@ -217,10 +217,19 @@ jobs:
         id: cache
         uses: actions/cache/restore@v4
         with:
+          # Cache the whole C:\ProgramData\BHoM tree, not just Assemblies.
+          # Each dep repo's PostBuildEvent populates multiple sibling dirs
+          # (Resources, GrasshopperPlugin, DataSets, Extensions, Upgrades);
+          # WiX's heat.exe then harvests from those. Caching only Assemblies
+          # leaves the others empty on cache hit, causing HEAT5053 at
+          # installer packaging time.
           path: |
-            C:\ProgramData\BHoM\Assemblies
+            C:\ProgramData\BHoM
             ${{ github.workspace }}\Build\dep-manifest.json
-          key: assemblies-${{ runner.os }}-${{ needs.resolve.outputs.release_type }}-${{ needs.resolve.outputs.source_branch }}-${{ steps.deps_resolve.outputs.deps_hash }}
+          # v2: cache scope widened from Assemblies-only to the whole
+          # C:\ProgramData\BHoM tree (see path above). Bumping the prefix
+          # invalidates v1 caches that would otherwise satisfy this key.
+          key: bhom-tree-v2-${{ runner.os }}-${{ needs.resolve.outputs.release_type }}-${{ needs.resolve.outputs.source_branch }}-${{ steps.deps_resolve.outputs.deps_hash }}
 
       - name: Provide .NET Framework 4.0 reference assemblies
         # InstallerCA.csproj targets .NET Framework v4.0, matching BHoMBot's
@@ -380,8 +389,10 @@ jobs:
         if: success() && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
+          # Must match Restore Assemblies cache above. See note there on
+          # why the entire C:\ProgramData\BHoM tree is cached.
           path: |
-            C:\ProgramData\BHoM\Assemblies
+            C:\ProgramData\BHoM
             ${{ github.workspace }}\Build\dep-manifest.json
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
