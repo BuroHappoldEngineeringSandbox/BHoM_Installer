@@ -45,7 +45,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('alpha', 'rc', 'beta')]
+    [ValidateSet('alpha', 'rc', 'final')]
     [string]$ReleaseType,
 
     [string]$PatchVersion,
@@ -281,9 +281,15 @@ Write-Host "::group::Build installer ($ReleaseType, patch=$PatchVersion)"
 if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed for installer solution" }
 
 # Map ReleaseType to the WiX ReleaseType property. The wixproj only declares
-# branches for 'alpha' and 'beta', so 'rc' collapses to 'beta' here (both are
-# beta-tier builds; the distinction lives in the GitHub Release flags).
-$wixReleaseType = if ($ReleaseType -eq 'rc') { 'beta' } else { $ReleaseType }
+# branches for 'alpha' and 'beta', so 'rc' and 'final' both collapse to
+# 'beta' here (rc and final are beta-tier builds in terms of contents;
+# the distinction between them lives in the GitHub Release flags rather
+# than the .msi).
+$wixReleaseType = switch ($ReleaseType) {
+    'rc'    { 'beta' }
+    'final' { 'beta' }
+    default { $ReleaseType }
+}
 
 $msbuildArgs = @(
     $installerSln,
