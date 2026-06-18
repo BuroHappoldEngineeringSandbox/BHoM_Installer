@@ -268,7 +268,17 @@ resolve_main() {
                     ;;
                 alpha-beta)
                     warn_non_conventional_dependency_branch alpha-beta "$dependency_branch"
-                    assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
+                    # Rule 3 is SOFT for alpha-beta dispatches. The coordinator
+                    # initiated this run deliberately; if v{M}.{N}.0-beta has
+                    # already shipped, the resulting alpha.beta.N tag will
+                    # SemVer-sort below the shipped beta (semantically odd but
+                    # recoverable). Surface a warning rather than hard-fail.
+                    # Rule 3 stays hard for the beta dispatch path below
+                    # because publishing v{M}.{N}.0-beta a second time would
+                    # silently overwrite the shipped release.
+                    if ! assert_no_shipped_release_for "$wix_m" "$wix_n" 2>/dev/null; then
+                        printf '::warning title=Pre-release after ship::v%s.%s.0-beta is already shipped on this line. Continuing because alpha-beta dispatches are coordinator-driven; the resulting tag will SemVer-sort below the shipped beta. Bump BHoM_Installer.wixproj MinorVersion if this was unintended.\n' "$wix_m" "$wix_n" >&2
+                    fi
                     release_tag=$(compute_alpha_beta_tag "$wix_m" "$wix_n")
                     # MSI PatchVersion = the alpha.beta counter (e.g. v9.2.0-alpha.beta.3 -> 3).
                     msi_patch_version="${release_tag##*-alpha.beta.}"
@@ -733,16 +743,41 @@ EOF
     assert_equal "dispatch alpha + v9.2.0-beta shipped -> release_tag empty" "" \
         "$(echo "$out" | grep '^release_tag=' | cut -d= -f2)"
 
-    # Dispatched alpha-beta when v9.2.0-beta shipped -> rule 3 STILL HARD-fails
-    # (the publish path remains gated for pre-release tiers other than alpha).
+    # Dispatched alpha-beta when v9.2.0-beta shipped -> rule 3 SOFT: warns but
+    # succeeds. The coordinator initiated this deliberately; the resulting
+    # alpha.beta.N tag SemVer-sorts below the shipped beta, but that's a
+    # coordinator decision, not a CI policy decision.
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
         INPUT_RELEASE_TYPE=alpha-beta INPUT_DEPENDENCY_BRANCH=develop INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0-beta"; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "alpha-beta dispatch + v9.2.0-beta shipped -> release_type=alpha-beta" "alpha-beta" \
+        "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
+    assert_equal "alpha-beta dispatch + v9.2.0-beta shipped -> tag computed" "v9.2.0-alpha.beta.1" \
+        "$(echo "$out" | grep '^release_tag=' | cut -d= -f2)"
+
+    # Warning surfaces on stderr; exit code is 0.
+    local err_out
+    err_out=$(lookup_tags()    { :; }; \
+              lookup_releases(){ printf '%s\n' "v9.2.0-beta"; }; \
+              resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$err_out" in
+        *"Pre-release after ship"*"exit=0") assert_equal "alpha-beta + shipped line: pre-release-after-ship warning, exits 0" "ok" "ok" ;;
+        *) assert_equal "alpha-beta + shipped line: pre-release-after-ship warning, exits 0" "ok" "got: $err_out" ;;
+    esac
+
+    # Beta dispatch still hard-fails when v9.2.0-beta shipped (rule 4 + rule 3
+    # layering preserved — beta publishing would silently overwrite the
+    # existing release).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop INPUT_DEFAULT_BRANCH=develop
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ printf '%s\n' "v9.2.0-beta"; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"already been released"*"exit=2") assert_equal "rule 3 still hard on alpha-beta dispatch when v9.2.0-beta shipped" "ok" "ok" ;;
-        *) assert_equal "rule 3 still hard on alpha-beta dispatch when v9.2.0-beta shipped" "ok" "got: $out" ;;
+        *"already been released"*"exit=2") assert_equal "rule 3/4 still hard on beta dispatch when v9.2.0-beta shipped" "ok" "ok" ;;
+        *) assert_equal "rule 3/4 still hard on beta dispatch when v9.2.0-beta shipped" "ok" "got: $out" ;;
     esac
 
     # Default schedule (no shipped release) -> still should_publish=false
