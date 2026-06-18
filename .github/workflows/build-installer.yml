@@ -635,40 +635,6 @@ jobs:
           make_latest: ${{ needs.resolve.outputs.make_latest }}
           prerelease:  ${{ needs.resolve.outputs.prerelease }}
 
-  # Soft-fail path. When the resolve job sets should_publish=false (rule 3
-  # tripped on a scheduled nightly because v{M}.{N}.0 has already shipped),
-  # the publish job above is skipped. This job opens or comments on a
-  # tracking issue so the wixproj bump does not rot silently. Only fires
-  # when build + install-test were green AND publish was deliberately skipped
-  # via the should_publish gate; a hard build/test failure flows to
-  # notify-on-failure instead.
-  post-ship-bump-needed:
-    name: Open issue for wixproj bump needed
-    needs: [resolve, build, install-test]
-    if: |
-      always() &&
-      needs.resolve.outputs.should_publish == 'false' &&
-      needs.build.result == 'success' &&
-      needs.install-test.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
-      - name: Checkout installer repo (for the notify script)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          sparse-checkout: |
-            scripts/notify-bump-needed.sh
-          sparse-checkout-cone-mode: false
-
-      - name: Open or update tracking issue
-        env:
-          GH_TOKEN:  ${{ github.token }}
-          WIX_MAJOR: ${{ needs.resolve.outputs.wix_major }}
-          WIX_MINOR: ${{ needs.resolve.outputs.wix_minor }}
-        run: bash scripts/notify-bump-needed.sh
-
   # Open a GitHub Issue when an unattended build fails, so the breakage does
   # not rot silently. Fires on:
   #   schedule    Scheduled nightly. Nobody is watching at 00:45 UTC.
