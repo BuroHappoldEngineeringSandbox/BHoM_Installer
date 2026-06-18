@@ -314,9 +314,11 @@ jobs:
         # nearly nothing; a huge one means something is being bundled that shouldn't
         # be. Current builds land ~46 MB; we use a 30-100 MB envelope to allow
         # normal growth but trip on order-of-magnitude breakage.
+        # Get-Item with -ErrorAction Stop fails-loud if no .msi is present, which
+        # the downstream upload step would also catch via if-no-files-found: error;
+        # surfacing it here keeps attribution clean (size step vs upload step).
         run: |
-          $msi = Get-Item '${{ github.workspace }}/Build/*.msi' | Select-Object -First 1
-          if (-not $msi) { throw "No .msi found in ${{ github.workspace }}/Build/" }
+          $msi = Get-Item '${{ github.workspace }}/Build/*.msi' -ErrorAction Stop | Select-Object -First 1
           $mb = [math]::Round($msi.Length / 1MB, 2)
           Write-Host "::notice::.msi size: $mb MB ($($msi.Name))"
           if ($mb -lt 30 -or $mb -gt 100) {
