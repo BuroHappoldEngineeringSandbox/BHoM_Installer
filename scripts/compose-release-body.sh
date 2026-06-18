@@ -18,14 +18,16 @@
 #
 # Three-input model (see proposal.md Section 6):
 #   - INSTALLER_REF      The installer-repo branch the workflow ran on. Drives
-#                        the canonical/non-canonical determination (canonical
-#                        means develop for alpha/alpha-beta, main for beta — these
-#                        are the branches where release notes can be diffed
-#                        meaningfully).
+#                        the "canonical installer ref" check below — canonical
+#                        means the repo's default branch (passed in via
+#                        CANONICAL_INSTALLER_REF), the same branch alpha
+#                        schedules run from and beta dispatches are constrained to.
 #   - DEPENDENCY_BRANCH  The dep-clone try-first branch. Provenance only here.
 #
 # Required environment:
 #   INSTALLER_REF        Installer-repo branch the workflow ran on (github.ref_name).
+#   CANONICAL_INSTALLER_REF  Repo default branch (e.g. 'develop'). Sourced from
+#                            github.event.repository.default_branch in the workflow.
 #   DEPENDENCY_BRANCH    Dependency-branch input used by Build-Installer.ps1.
 #   GITHUB_EVENT_NAME    Provided by GitHub Actions.
 #   BUILT_AT             ISO8601 UTC timestamp from dep-manifest.json's built_at field.
@@ -48,16 +50,15 @@ set -eu
 
 run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-# Decide whether this build is on the canonical lineage based on the
-# installer-repo branch the workflow ran on:
-#   alpha / alpha-beta -> develop
-#   beta               -> main (hard rule enforced at resolve)
-# Anything else is a non-canonical dispatch (typically alpha from a feature
-# branch), which renders a warning block instead of the diff section.
-case "${RELEASE_TYPE}" in
-    beta)    canonical_installer_ref="main" ;;
-    *)       canonical_installer_ref="develop" ;;
-esac
+# canonical installer_ref is the repo's default branch, regardless of release
+# type. For beta the rule is hard-enforced at resolve time (rule 6); for alpha
+# and alpha-beta the schedule trigger and dispatch convention both land here,
+# while dispatched feature-branch alphas are explicitly non-canonical.
+canonical_installer_ref="${CANONICAL_INSTALLER_REF:-}"
+if [ -z "$canonical_installer_ref" ]; then
+    echo "::error::CANONICAL_INSTALLER_REF is required (workflow should pass github.event.repository.default_branch)." >&2
+    exit 3
+fi
 is_non_canonical="false"
 if [ "${INSTALLER_REF}" != "${canonical_installer_ref}" ]; then
     is_non_canonical="true"
