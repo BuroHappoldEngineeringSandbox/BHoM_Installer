@@ -48,6 +48,16 @@
 #   release-body.md      Final body, ready for softprops/action-gh-release.
 set -eu
 
+# ─── overridable IO (for --self-test) ──────────────────────────────────────
+
+# Fetch the jobs JSON for the current workflow run. Override in tests by
+# redefining this function before invoking the main body of the script.
+lookup_jobs_json() {
+    gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate
+}
+
+compose_main() {
+
 run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
 # canonical installer_ref is the repo's default branch, regardless of release
@@ -57,7 +67,7 @@ run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 canonical_installer_ref="${CANONICAL_INSTALLER_REF:-}"
 if [ -z "$canonical_installer_ref" ]; then
     echo "::error::CANONICAL_INSTALLER_REF is required (workflow should pass github.event.repository.default_branch)." >&2
-    exit 3
+    return 3
 fi
 is_non_canonical="false"
 if [ "${INSTALLER_REF}" != "${canonical_installer_ref}" ]; then
@@ -78,7 +88,7 @@ case "${RELEASE_TYPE}" in
 esac
 
 # Per-OS test results from the workflow's Jobs API.
-jobs_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate)
+jobs_json=$(lookup_jobs_json)
 test_results_rows=$(echo "$jobs_json" | jq -r '
     .jobs
     | map(select(.name | startswith("Install + uninstall (")))
@@ -150,3 +160,177 @@ fi
 echo ""
 echo "=== Release body preview (first 80 lines) ==="
 head -80 release-body.md
+
+}  # end compose_main
+
+# ─── self-test harness ─────────────────────────────────────────────────────
+
+self_test() {
+    local pass=0 fail=0
+    assert_contains() {
+        local desc="$1" needle="$2" haystack="$3"
+        if [[ "$haystack" == *"$needle"* ]]; then
+            echo "PASS: $desc"
+            pass=$((pass + 1))
+        else
+            echo "FAIL: $desc"
+            echo "  expected to contain: $needle"
+            fail=$((fail + 1))
+        fi
+    }
+    assert_not_contains() {
+        local desc="$1" needle="$2" haystack="$3"
+        if [[ "$haystack" != *"$needle"* ]]; then
+            echo "PASS: $desc"
+            pass=$((pass + 1))
+        else
+            echo "FAIL: $desc"
+            echo "  expected NOT to contain: $needle"
+            fail=$((fail + 1))
+        fi
+    }
+    assert_equal() {
+        local desc="$1" expected="$2" actual="$3"
+        if [ "$expected" = "$actual" ]; then
+            echo "PASS: $desc"
+            pass=$((pass + 1))
+        else
+            echo "FAIL: $desc"
+            echo "  expected: $expected"
+            echo "  actual:   $actual"
+            fail=$((fail + 1))
+        fi
+    }
+
+    # Stub gh; the canonical-path tests exercise lookup_jobs_json directly.
+    lookup_jobs_json() {
+        cat <<'EOF'
+{
+  "jobs": [
+    { "name": "Install + uninstall (windows-2022)", "conclusion": "success",
+      "html_url": "https://example.com/job/1" },
+    { "name": "Install + uninstall (windows-2025)", "conclusion": "success",
+      "html_url": "https://example.com/job/2" },
+    { "name": "Build alpha installer", "conclusion": "success",
+      "html_url": "https://example.com/job/3" }
+  ]
+}
+EOF
+    }
+
+    # Shared env (workflow-style values).
+    setup_env() {
+        export GITHUB_SERVER_URL="https://example.com"
+        export GITHUB_REPOSITORY="example-org/example-repo"
+        export GITHUB_RUN_ID="123456"
+        export GITHUB_SHA="abcdef1234567890"
+        export GITHUB_EVENT_NAME="workflow_dispatch"
+        export BUILT_AT="2026-06-18T10:00:00.0000000+00:00"
+        export DEPENDENCY_BRANCH="develop"
+        export IS_PRERELEASE="false"
+        export CANONICAL_INSTALLER_REF="develop"
+    }
+
+    local tmpdir; tmpdir=$(mktemp -d)
+    cd "$tmpdir"
+
+    # ── Error path: empty CANONICAL_INSTALLER_REF ──
+    setup_env
+    export CANONICAL_INSTALLER_REF=""
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha"
+    local out
+    out=$(compose_main 2>&1 || true)
+    assert_contains "missing CANONICAL_INSTALLER_REF errors" "CANONICAL_INSTALLER_REF is required" "$out"
+
+    # ── Canonical render: alpha schedule from default branch ──
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha"
+    export GITHUB_EVENT_NAME="schedule"
+    rm -f release-notes-section.md release-body.md
+    compose_main >/dev/null 2>&1
+    local body; body=$(cat release-body.md)
+    assert_contains "alpha intro present" "Pre-release alpha build" "$body"
+    assert_contains "alpha schedule renders provenance"  "### Build provenance" "$body"
+    assert_contains "alpha schedule renders installer branch" "| Installer branch | \`develop\` |" "$body"
+    assert_contains "alpha schedule renders dependency branch" "| Dependency branch | \`develop\` |" "$body"
+    assert_contains "alpha schedule renders test-results table" "### Test results" "$body"
+    assert_contains "alpha schedule includes windows-2022 row" "| windows-2022 |" "$body"
+    assert_contains "alpha schedule includes windows-2025 row" "| windows-2025 |" "$body"
+    assert_not_contains "canonical render does NOT include non-canonical warning" \
+        "Non-canonical installer branch" "$body"
+    assert_contains "canonical render with no notes file falls back to initial-release stub" \
+        "### Initial release" "$body"
+
+    # ── Canonical render with release-notes-section.md present ──
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha"
+    printf '### Changes since v9.1.0-beta\n\n- Dep X bumped to v2.\n' >release-notes-section.md
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_contains "canonical render emits release-notes-section content" "Changes since v9.1.0-beta" "$body"
+    assert_contains "canonical render emits dep diff line" "Dep X bumped to v2" "$body"
+    assert_not_contains "canonical render with notes file does NOT emit initial-release stub" \
+        "### Initial release" "$body"
+    rm -f release-notes-section.md
+
+    # ── Non-canonical render: dispatched alpha from a feature branch ──
+    setup_env
+    export INSTALLER_REF="feature/wix-pin-test"
+    export RELEASE_TYPE="alpha"
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_contains "non-canonical render emits warning" "Non-canonical installer branch" "$body"
+    assert_contains "non-canonical render names the build branch" "feature/wix-pin-test" "$body"
+    assert_contains "non-canonical render names the canonical branch" "conventional \`develop\`" "$body"
+    assert_not_contains "non-canonical render does NOT emit dep-diff section" \
+        "### Changes since" "$body"
+
+    # ── Intro sentence varies by release type ──
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="beta"
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_contains "beta intro: release build language" "Release build" "$body"
+    assert_not_contains "beta intro does NOT use pre-release language" "Pre-release" "$body"
+
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha-beta"
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_contains "alpha-beta intro: release-candidate language" "Release candidate build" "$body"
+    assert_contains "alpha-beta intro: freeze-window context" "freeze window" "$body"
+
+    # ── Test-results table reflects every matrix leg present ──
+    # The fixture has windows-2022 + windows-2025 + a Build leg. Only the
+    # two install-test legs should appear in the table.
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha"
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_not_contains "Build leg is filtered out of test-results table" "| Build alpha installer |" "$body"
+
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+
+    echo
+    echo "Results: $pass passed, $fail failed"
+    [ "$fail" -eq 0 ]
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    self_test
+    exit $?
+fi
+
+compose_main || exit $?
