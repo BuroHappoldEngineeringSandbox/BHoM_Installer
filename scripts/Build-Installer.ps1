@@ -160,41 +160,32 @@ function Build-Solution {
     if ($LASTEXITCODE -ne 0) { throw "MSBuild failed for $SlnPath (config=$Config)" }
 }
 
-function Clone-And-Build-FromFile {
-    param([string]$FileName)
+function Build-ManifestFile {
+    # Clone-and-build the repos listed in an IncludedRepos manifest. Two line
+    # formats supported, selected by the -WithConfig switch:
+    #
+    #   default (org/repo):          one repo per line, builds the repo's
+    #                                <name>.sln at the default 'Release' config.
+    #                                Used by core.txt, dependencies.txt, etc.
+    #
+    #   -WithConfig (org/repo/Cfg):  one repo per line plus an MSBuild config
+    #                                suffix. Builds <name>.sln at the named
+    #                                config. Used by altConfigs.txt, which
+    #                                exists to build alternate WiX-target
+    #                                configurations of the same repo
+    #                                (e.g. Revit_Toolkit / Release2024).
+    #
+    # Lines beginning with '#' are ignored. Trims surrounding whitespace.
+    # Missing manifest file is a soft skip (expected for BHE-only manifests
+    # in the BHoM installer).
+    param(
+        [string]$FileName,
+        [switch]$WithConfig
+    )
 
     $manifest = Join-Path $manifestDir $FileName
     if (-not (Test-Path $manifest)) {
         Write-Host "  [skip manifest] $FileName not present (this is expected for BHE-only files in the BHoM installer)"
-        return
-    }
-
-    $repos = Get-Content $manifest |
-             Where-Object { $_ -and -not $_.StartsWith('#') } |
-             ForEach-Object { $_.Trim() } |
-             Where-Object { $_ }
-
-    if ($repos.Count -eq 0) {
-        Write-Host "  [empty] $FileName has no entries"
-        return
-    }
-
-    Write-Host "::group::$FileName ($($repos.Count) repos)"
-    foreach ($repo in $repos) {
-        Write-Host "----- $repo -----"
-        $target = Clone-Repo -OrgRepo $repo
-        $sln    = Join-Path $target "$(Split-Path -Leaf $target).sln"
-        Build-Solution -SlnPath $sln
-    }
-    Write-Host "::endgroup::"
-}
-
-function Build-Configs-FromFile {
-    param([string]$FileName)
-
-    $manifest = Join-Path $manifestDir $FileName
-    if (-not (Test-Path $manifest)) {
-        Write-Host "  [skip configs] $FileName not present"
         return
     }
 
@@ -203,23 +194,34 @@ function Build-Configs-FromFile {
                ForEach-Object { $_.Trim() } |
                Where-Object { $_ }
 
-    if ($entries.Count -eq 0) { return }
+    if ($entries.Count -eq 0) {
+        Write-Host "  [empty] $FileName has no entries"
+        return
+    }
 
-    Write-Host "::group::$FileName ($($entries.Count) configs)"
+    $kind = if ($WithConfig) { 'configs' } else { 'repos' }
+    Write-Host "::group::$FileName ($($entries.Count) $kind)"
     foreach ($entry in $entries) {
-        $parts = $entry.Split('/')
-        if ($parts.Length -lt 3) {
-            Write-Host "::warning::Malformed altConfigs entry (need org/repo/Config): $entry"
-            continue
+        if ($WithConfig) {
+            $parts = $entry.Split('/')
+            if ($parts.Length -lt 3) {
+                Write-Host "::warning::Malformed $FileName entry (need org/repo/Config): $entry"
+                continue
+            }
+            $orgRepo = "$($parts[0])/$($parts[1])"
+            $config  = $parts[2]
+            $name    = $parts[1]
+            Write-Host "----- $orgRepo @ $config -----"
+            $target = Clone-Repo -OrgRepo $orgRepo
+            $sln    = Join-Path $target "$name.sln"
+            Build-Solution -SlnPath $sln -Config $config
         }
-        $orgRepo = "$($parts[0])/$($parts[1])"
-        $config  = $parts[2]
-        $name    = $parts[1]
-
-        Write-Host "----- $orgRepo @ $config -----"
-        $target = Clone-Repo -OrgRepo $orgRepo
-        $sln    = Join-Path $target "$name.sln"
-        Build-Solution -SlnPath $sln -Config $config
+        else {
+            Write-Host "----- $entry -----"
+            $target = Clone-Repo -OrgRepo $entry
+            $sln    = Join-Path $target "$(Split-Path -Leaf $target).sln"
+            Build-Solution -SlnPath $sln
+        }
     }
     Write-Host "::endgroup::"
 }
@@ -228,23 +230,23 @@ function Build-Configs-FromFile {
 
 # Order matters: core first, then adapters, then UI, then deps, then includes,
 # and so on. Some files are BHE-only and will not exist in the BHoM_Installer
-# repo; Clone-And-Build-FromFile handles missing files gracefully.
+# repo; Build-ManifestFile handles missing files gracefully.
 #
 # BHoMBot parallelises some of these groups. For this initial iteration we run
 # sequentially because it is easier to debug and produces deterministic output.
 # Parallelism is a Phase 1.5 optimisation once the workflow is stable.
 
-Clone-And-Build-FromFile -FileName 'core.txt'
-Clone-And-Build-FromFile -FileName 'adapterCore.txt'
-Clone-And-Build-FromFile -FileName 'uiCore.txt'
-Clone-And-Build-FromFile -FileName 'dependencies.txt'
-Clone-And-Build-FromFile -FileName 'include.txt'
-Clone-And-Build-FromFile -FileName 'userInterfaces.txt'
-Clone-And-Build-FromFile -FileName 'analytics.txt'        # BHE-only, absent in BHoM_Installer
-Clone-And-Build-FromFile -FileName 'zeroCode.txt'         # BHE-only, absent in BHoM_Installer
-Clone-And-Build-FromFile -FileName 'revitTools_Beta.txt'  # BHE-only, absent in BHoM_Installer
+Build-ManifestFile -FileName 'core.txt'
+Build-ManifestFile -FileName 'adapterCore.txt'
+Build-ManifestFile -FileName 'uiCore.txt'
+Build-ManifestFile -FileName 'dependencies.txt'
+Build-ManifestFile -FileName 'include.txt'
+Build-ManifestFile -FileName 'userInterfaces.txt'
+Build-ManifestFile -FileName 'analytics.txt'        # BHE-only, absent in BHoM_Installer
+Build-ManifestFile -FileName 'zeroCode.txt'         # BHE-only, absent in BHoM_Installer
+Build-ManifestFile -FileName 'revitTools_Beta.txt'  # BHE-only, absent in BHoM_Installer
 
-Build-Configs-FromFile -FileName 'altConfigs.txt'
+Build-ManifestFile -FileName 'altConfigs.txt' -WithConfig
 
 # NOTE: BHoMBot calls UpdateFixedRevitVersioningTypes() here (Revit API mocks
 # for the Versioning_Toolkit build), followed by a 60-second sleep after the
@@ -252,11 +254,11 @@ Build-Configs-FromFile -FileName 'altConfigs.txt'
 # out to be load-bearing, the Versioning_Toolkit build will fail or produce
 # incorrect output, at which point we add them back.
 
-Clone-And-Build-FromFile -FileName 'versioning.txt'
+Build-ManifestFile -FileName 'versioning.txt'
 
 if ($ReleaseType -eq 'alpha') {
-    Clone-And-Build-FromFile -FileName 'alphaIncludes.txt'
-    Build-Configs-FromFile   -FileName 'alphaConfigs.txt'
+    Build-ManifestFile -FileName 'alphaIncludes.txt'
+    Build-ManifestFile -FileName 'alphaConfigs.txt' -WithConfig
 }
 
 # ─── Write IncludedDLLs.txt (mirrors BHoMBot's SaveIncludedDLLs.cs) ─────────
