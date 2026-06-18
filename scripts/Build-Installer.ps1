@@ -32,8 +32,7 @@
 
 .PARAMETER InstallerRepoName
     Folder name of the installer repo within CodeLocation. Defaults to
-    BHoM_Installer. For BHE builds this would be BuroHappold_Installer (not yet
-    supported in this iteration).
+    BHoM_Installer.
 
 .PARAMETER DependencyBranch
     Branch to try first on each dependency repo clone. Falls back to each
@@ -176,8 +175,9 @@ function Build-ManifestFile {
     #                                (e.g. Revit_Toolkit / Release2024).
     #
     # Lines beginning with '#' are ignored. Trims surrounding whitespace.
-    # Missing manifest file is a soft skip (expected for BHE-only manifests
-    # in the BHoM installer).
+    # Missing manifest file is a soft skip — surfaces the gap without failing
+    # the build, since manifests evolve and a renamed/removed file should not
+    # break the dispatch.
     param(
         [string]$FileName,
         [switch]$WithConfig
@@ -185,7 +185,7 @@ function Build-ManifestFile {
 
     $manifest = Join-Path $manifestDir $FileName
     if (-not (Test-Path $manifest)) {
-        Write-Host "  [skip manifest] $FileName not present (this is expected for BHE-only files in the BHoM installer)"
+        Write-Host "  [skip manifest] $FileName not present in IncludedRepos/"
         return
     }
 
@@ -229,8 +229,7 @@ function Build-ManifestFile {
 # ─── Clone + build the dependency graph (mirrors BHoMBot's CloneInstaller.cs) ─
 
 # Order matters: core first, then adapters, then UI, then deps, then includes,
-# and so on. Some files are BHE-only and will not exist in the BHoM_Installer
-# repo; Build-ManifestFile handles missing files gracefully.
+# and so on. Missing manifests are soft-skipped by Build-ManifestFile.
 #
 # BHoMBot parallelises some of these groups. For this initial iteration we run
 # sequentially because it is easier to debug and produces deterministic output.
@@ -242,9 +241,6 @@ Build-ManifestFile -FileName 'uiCore.txt'
 Build-ManifestFile -FileName 'dependencies.txt'
 Build-ManifestFile -FileName 'include.txt'
 Build-ManifestFile -FileName 'userInterfaces.txt'
-Build-ManifestFile -FileName 'analytics.txt'        # BHE-only, absent in BHoM_Installer
-Build-ManifestFile -FileName 'zeroCode.txt'         # BHE-only, absent in BHoM_Installer
-Build-ManifestFile -FileName 'revitTools_Beta.txt'  # BHE-only, absent in BHoM_Installer
 
 Build-ManifestFile -FileName 'altConfigs.txt' -WithConfig
 
