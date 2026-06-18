@@ -8,7 +8,8 @@
 # Three-input model (see proposal.md Section 6):
 #   1. Installer branch  : GITHUB_REF (the workflow's ref, set by GHA dispatch
 #                          via --ref or 'Use workflow from Branch' in the UI).
-#                          For 'beta' the workflow ref must be refs/heads/main.
+#                          For 'beta' the workflow ref must equal the repo's
+#                          default branch (passed in via INPUT_DEFAULT_BRANCH).
 #                          For 'alpha'/'alpha-beta' any branch is accepted.
 #   2. Release type      : INPUT_RELEASE_TYPE input (alpha | alpha-beta | beta).
 #   3. Dependency branch : INPUT_DEPENDENCY_BRANCH input. Tried on each dep
@@ -29,6 +30,11 @@
 #   INPUT_RELEASE_TYPE      'alpha' | 'alpha-beta' | 'beta' on workflow_dispatch.
 #   INPUT_DEPENDENCY_BRANCH Branch to try first on each dep clone; defaults to
 #                           'develop' for both schedule and dispatch when empty.
+#   INPUT_DEFAULT_BRANCH    Repo default branch (e.g. 'develop'). Required when
+#                           INPUT_RELEASE_TYPE=beta; ignored otherwise. Sourced
+#                           from github.event.repository.default_branch in the
+#                           workflow. The rule-6 check compares the workflow
+#                           ref against refs/heads/${INPUT_DEFAULT_BRANCH}.
 #   GH_TOKEN                For gh api calls. Workflow's github.token suffices.
 #
 # Outputs (stdout):
@@ -167,18 +173,18 @@ assert_release_not_already_published() {
 }
 
 # Conflict rule 6: beta dispatches must run with the workflow ref pointing
-# at refs/heads/main. This enforces the develop->main merge ceremony for
-# user-facing releases. Alpha and alpha-beta are not constrained — they can
-# dispatch from any branch (useful for feature-branch builds and pre-release
-# testing).
+# at the repo's default branch. This enforces the "shipped releases come from
+# a known canonical branch" invariant for user-facing releases. Alpha and
+# alpha-beta are not constrained — they can dispatch from any branch (useful
+# for feature-branch builds and pre-release testing).
 #
 # The tag created by softprops/action-gh-release lands on the workflow's
 # commit, which is GITHUB_REF's HEAD at checkout time. So enforcing the
-# workflow ref also constrains where the v9.x.0-beta tag lands.
-assert_workflow_ref_is_main_for_beta() {
-    local release_type="$1" workflow_ref="$2"
-    if [ "$release_type" = "beta" ] && [ "$workflow_ref" != "refs/heads/main" ]; then
-        err "Beta dispatches must run with the workflow ref set to refs/heads/main. Got '${workflow_ref}'. Merge develop->main first, then re-dispatch via: gh workflow run build-installer.yml --ref main -f release_type=beta."
+# workflow ref also constrains where the v{M}.{N}.0-beta tag lands.
+assert_workflow_ref_is_default_for_beta() {
+    local release_type="$1" workflow_ref="$2" default_branch="$3"
+    if [ "$release_type" = "beta" ] && [ "$workflow_ref" != "refs/heads/${default_branch}" ]; then
+        err "Beta dispatches must run with the workflow ref set to refs/heads/${default_branch} (the repo's default branch). Got '${workflow_ref}'. Re-dispatch via: gh workflow run build-installer.yml --ref ${default_branch} -f release_type=beta."
         return 2
     fi
 }
@@ -211,6 +217,7 @@ resolve_main() {
     local workflow_ref="${GITHUB_REF:-}"
     local in_type="${INPUT_RELEASE_TYPE:-}"
     local in_dep_branch="${INPUT_DEPENDENCY_BRANCH:-}"
+    local in_default_branch="${INPUT_DEFAULT_BRANCH:-}"
 
     local wixproj="${WIXPROJ_PATH:-BHoM_Installer/BHoM_Installer.wixproj}"
     local mn; mn=$(read_wixproj_version "$wixproj") || return 3
@@ -268,7 +275,11 @@ resolve_main() {
                     make_latest=false
                     ;;
                 beta)
-                    assert_workflow_ref_is_main_for_beta beta "$workflow_ref" || return 2
+                    if [ -z "$in_default_branch" ]; then
+                        err "INPUT_DEFAULT_BRANCH is required for beta dispatches (the workflow should pass github.event.repository.default_branch)."
+                        return 3
+                    fi
+                    assert_workflow_ref_is_default_for_beta beta "$workflow_ref" "$in_default_branch" || return 2
                     warn_non_conventional_dependency_branch beta "$dependency_branch"
                     release_tag=$(derive_beta_tag "$wix_m" "$wix_n")
                     assert_release_not_already_published "$release_tag" || return 2
@@ -439,26 +450,34 @@ EOF
             --jq '.[].tag_name'
     }
 
-    # ── assert_workflow_ref_is_main_for_beta ──
+    # ── assert_workflow_ref_is_default_for_beta ──
 
-    assert_equal "rule 6: beta + ref=refs/heads/main passes" "ok" \
-        "$(assert_workflow_ref_is_main_for_beta beta refs/heads/main >/dev/null 2>&1 && echo ok || echo fail)"
+    assert_equal "rule 6: beta + ref=refs/heads/develop + default=develop passes" "ok" \
+        "$(assert_workflow_ref_is_default_for_beta beta refs/heads/develop develop >/dev/null 2>&1 && echo ok || echo fail)"
 
-    assert_equal "rule 6: beta + ref=refs/heads/develop fails" "fail" \
-        "$(assert_workflow_ref_is_main_for_beta beta refs/heads/develop >/dev/null 2>&1 && echo ok || echo fail)"
+    assert_equal "rule 6: beta + ref=refs/heads/main + default=develop fails" "fail" \
+        "$(assert_workflow_ref_is_default_for_beta beta refs/heads/main develop >/dev/null 2>&1 && echo ok || echo fail)"
 
-    assert_equal "rule 6: beta + ref=refs/heads/feature/x fails" "fail" \
-        "$(assert_workflow_ref_is_main_for_beta beta refs/heads/feature/x >/dev/null 2>&1 && echo ok || echo fail)"
+    assert_equal "rule 6: beta + ref=refs/heads/feature/x + default=develop fails" "fail" \
+        "$(assert_workflow_ref_is_default_for_beta beta refs/heads/feature/x develop >/dev/null 2>&1 && echo ok || echo fail)"
 
-    assert_equal "rule 6: beta + ref=refs/tags/v9.2.0-beta fails" "fail" \
-        "$(assert_workflow_ref_is_main_for_beta beta refs/tags/v9.2.0-beta >/dev/null 2>&1 && echo ok || echo fail)"
+    assert_equal "rule 6: beta + ref=refs/tags/v9.2.0-beta + default=develop fails" "fail" \
+        "$(assert_workflow_ref_is_default_for_beta beta refs/tags/v9.2.0-beta develop >/dev/null 2>&1 && echo ok || echo fail)"
 
-    # alpha and alpha-beta are not constrained by the ref check
-    assert_equal "rule 6: alpha + ref=refs/heads/feature/x passes" "ok" \
-        "$(assert_workflow_ref_is_main_for_beta alpha refs/heads/feature/x >/dev/null 2>&1 && echo ok || echo fail)"
+    # Rule auto-follows the default branch — if the repo flipped to 'main',
+    # the rule now accepts main and rejects develop. Exercises the dynamic path.
+    assert_equal "rule 6: beta + ref=refs/heads/main + default=main passes (dynamic)" "ok" \
+        "$(assert_workflow_ref_is_default_for_beta beta refs/heads/main main >/dev/null 2>&1 && echo ok || echo fail)"
 
-    assert_equal "rule 6: alpha-beta + ref=refs/heads/feature/x passes" "ok" \
-        "$(assert_workflow_ref_is_main_for_beta alpha-beta refs/heads/feature/x >/dev/null 2>&1 && echo ok || echo fail)"
+    assert_equal "rule 6: beta + ref=refs/heads/develop + default=main fails (dynamic)" "fail" \
+        "$(assert_workflow_ref_is_default_for_beta beta refs/heads/develop main >/dev/null 2>&1 && echo ok || echo fail)"
+
+    # alpha and alpha-beta are not constrained by the ref check, regardless of default branch.
+    assert_equal "rule 6: alpha + ref=refs/heads/feature/x + default=develop passes" "ok" \
+        "$(assert_workflow_ref_is_default_for_beta alpha refs/heads/feature/x develop >/dev/null 2>&1 && echo ok || echo fail)"
+
+    assert_equal "rule 6: alpha-beta + ref=refs/heads/feature/x + default=develop passes" "ok" \
+        "$(assert_workflow_ref_is_default_for_beta alpha-beta refs/heads/feature/x develop >/dev/null 2>&1 && echo ok || echo fail)"
 
     # ── warn_non_conventional_dependency_branch ──
     # Soft warning: returns 0 always, but emits ::warning:: to stderr when
@@ -528,9 +547,9 @@ EOF
     assert_equal "dispatch alpha dependency_branch passes through" "feature/foo" \
         "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
 
-    # workflow_dispatch beta from main with conventional dep_branch.
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
-        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop
+    # workflow_dispatch beta from develop (default branch) with conventional dep_branch.
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
@@ -542,7 +561,7 @@ EOF
     assert_equal "dispatch beta -> msi_patch=0"                  "0"            "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
     # workflow_dispatch beta with empty INPUT_DEPENDENCY_BRANCH defaults to develop.
-    export INPUT_DEPENDENCY_BRANCH=""
+    export GITHUB_REF=refs/heads/develop INPUT_DEPENDENCY_BRANCH="" INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
@@ -568,8 +587,8 @@ EOF
         "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
     # dispatch beta when v9.2.0-beta already published -> rule 4 fires.
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
-        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0-beta"; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
@@ -578,19 +597,19 @@ EOF
         *) assert_equal "rule 4 trips on beta dispatch when already published" "ok" "got: $out" ;;
     esac
 
-    # dispatch beta from develop ref -> rule 6 fires (hard).
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
-        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop
+    # dispatch beta from main ref (non-default) -> rule 6 fires (hard).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
+        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"Beta dispatches must run with the workflow ref"*"exit=2") assert_equal "rule 6: beta + ref=develop fails" "ok" "ok" ;;
-        *) assert_equal "rule 6: beta + ref=develop fails" "ok" "got: $out" ;;
+        *"Beta dispatches must run with the workflow ref"*"exit=2") assert_equal "rule 6: beta + ref=main fails" "ok" "ok" ;;
+        *) assert_equal "rule 6: beta + ref=main fails" "ok" "got: $out" ;;
     esac
 
-    # dispatch beta from feature branch ref -> rule 6 fires.
-    export GITHUB_REF=refs/heads/feature/X
+    # dispatch beta from feature branch ref (non-default) -> rule 6 fires.
+    export GITHUB_REF=refs/heads/feature/X INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
@@ -599,8 +618,8 @@ EOF
         *) assert_equal "rule 6: beta + ref=feature/X fails" "ok" "got: $out" ;;
     esac
 
-    # dispatch beta from tag ref -> rule 6 fires.
-    export GITHUB_REF=refs/tags/v9.2.0-beta
+    # dispatch beta from tag ref (non-branch) -> rule 6 fires.
+    export GITHUB_REF=refs/tags/v9.2.0-beta INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
@@ -609,9 +628,20 @@ EOF
         *) assert_equal "rule 6: beta + ref=refs/tags/v9.2.0-beta fails" "ok" "got: $out" ;;
     esac
 
+    # dispatch beta with INPUT_DEFAULT_BRANCH unset -> internal error (exit 3).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=develop INPUT_DEFAULT_BRANCH=""
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ :; }; \
+          resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$out" in
+        *"INPUT_DEFAULT_BRANCH is required"*"exit=3") assert_equal "beta dispatch with empty INPUT_DEFAULT_BRANCH errors" "ok" "ok" ;;
+        *) assert_equal "beta dispatch with empty INPUT_DEFAULT_BRANCH errors" "ok" "got: $out" ;;
+    esac
+
     # dispatch alpha-beta with dep_branch=main -> succeeds with warning.
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
-        INPUT_RELEASE_TYPE=alpha-beta INPUT_DEPENDENCY_BRANCH=main
+        INPUT_RELEASE_TYPE=alpha-beta INPUT_DEPENDENCY_BRANCH=main INPUT_DEFAULT_BRANCH=develop
     local stderr_out
     stderr_out=$(lookup_tags()    { :; }; \
                  lookup_releases(){ :; }; \
@@ -631,9 +661,9 @@ EOF
         *) assert_equal "alpha-beta + dep_branch=feature/X warns but succeeds" "ok" "got: $stderr_out" ;;
     esac
 
-    # dispatch beta with dep_branch=main -> succeeds with warning (ref=main).
-    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
-        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=main
+    # dispatch beta with dep_branch=main -> succeeds with warning (ref=default, dep_branch unconventional).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=beta INPUT_DEPENDENCY_BRANCH=main INPUT_DEFAULT_BRANCH=develop
     stderr_out=$(lookup_tags()    { :; }; \
                  lookup_releases(){ :; }; \
                  resolve_main 2>&1 >/dev/null; echo "exit=$?")
@@ -717,7 +747,7 @@ EOF
         "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
 
     rm -f "$wixproj_tmp"
-    unset WIXPROJ_PATH TODAY_OVERRIDE GITHUB_EVENT_NAME GITHUB_REF INPUT_RELEASE_TYPE INPUT_DEPENDENCY_BRANCH
+    unset WIXPROJ_PATH TODAY_OVERRIDE GITHUB_EVENT_NAME GITHUB_REF INPUT_RELEASE_TYPE INPUT_DEPENDENCY_BRANCH INPUT_DEFAULT_BRANCH
 
     echo
     echo "Results: $pass passed, $fail failed"
