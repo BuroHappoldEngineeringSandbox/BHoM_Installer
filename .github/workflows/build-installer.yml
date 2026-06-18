@@ -4,7 +4,8 @@
 #   1. Installer branch  : "Use workflow from Branch" (GHA's --ref). The
 #                          installer repo is checked out at this ref and
 #                          the resulting release tag lands on this branch's
-#                          HEAD. Hard rule: beta dispatches must use main.
+#                          HEAD. Hard rule: beta dispatches must use the repo's
+#                          default branch.
 #   2. Release type      : workflow_dispatch input. alpha | alpha-beta | beta.
 #   3. Dependency branch : workflow_dispatch input. The branch tried on
 #                          each dep clone; falls back to that dep's own
@@ -36,9 +37,11 @@ on:
           beta       — shipped release. Tag: vM.N.0-beta derived from
                        BHoM_Installer.wixproj's MajorVersion/MinorVersion.
                        Marked Latest on the Releases page; prerelease=false.
-                       MUST be dispatched with "Use workflow from Branch" set to
-                       main (the workflow rejects any other ref). dependency_branch
-                       convention is develop (warning if not).
+                       MUST be dispatched with "Use workflow from Branch" set
+                       to the repo's default branch (resolved at runtime from
+                       github.event.repository.default_branch; the workflow
+                       rejects any other ref). dependency_branch convention is
+                       develop (warning if not).
         type: choice
         options:
           - alpha
@@ -104,9 +107,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # GITHUB_REF is set by GHA automatically; the resolve script reads
-          # it as the workflow-ref input (rule 6: beta must equal refs/heads/main).
+          # it as the workflow-ref input (rule 6: beta must equal the repo's
+          # default branch, which we pass in via INPUT_DEFAULT_BRANCH).
           INPUT_RELEASE_TYPE:      ${{ inputs.release_type }}
           INPUT_DEPENDENCY_BRANCH: ${{ inputs.dependency_branch }}
+          INPUT_DEFAULT_BRANCH:    ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           bash scripts/resolve-release-tag.sh >> "$GITHUB_OUTPUT"
@@ -528,15 +533,14 @@ jobs:
       - name: Download anchor's dep-manifest
         id: prev-manifest
         # Diff section renders for canonical installer-ref builds only:
-        #   alpha / alpha-beta -> installer_ref=develop
-        #   beta               -> installer_ref=main (hard rule enforced at resolve)
-        # Non-canonical dispatches (typically alpha-from-feature-branch) skip
-        # the download; compose-release-body.sh renders a warning block instead.
+        # canonical = installer_ref equals the repo's default branch (the same
+        # branch alpha schedules run from and beta dispatches are constrained
+        # to). Non-canonical dispatches (typically alpha-from-feature-branch)
+        # skip the download; compose-release-body.sh renders a warning block
+        # instead.
         if: |
-          steps.anchor.outputs.anchor_kind == 'stable' && (
-            (needs.resolve.outputs.installer_ref == 'develop' && needs.resolve.outputs.release_type != 'beta') ||
-            (needs.resolve.outputs.installer_ref == 'main' && needs.resolve.outputs.release_type == 'beta')
-          )
+          steps.anchor.outputs.anchor_kind == 'stable' &&
+          needs.resolve.outputs.installer_ref == github.event.repository.default_branch
         env:
           GH_TOKEN: ${{ github.token }}
           ANCHOR_TAG: ${{ steps.anchor.outputs.anchor_tag }}
@@ -556,10 +560,9 @@ jobs:
 
       - name: Generate dep-change release-notes section
         if: |
-          steps.anchor.outputs.anchor_kind == 'stable' && steps.prev-manifest.outputs.path != '' && (
-            (needs.resolve.outputs.installer_ref == 'develop' && needs.resolve.outputs.release_type != 'beta') ||
-            (needs.resolve.outputs.installer_ref == 'main' && needs.resolve.outputs.release_type == 'beta')
-          )
+          steps.anchor.outputs.anchor_kind == 'stable' &&
+          steps.prev-manifest.outputs.path != '' &&
+          needs.resolve.outputs.installer_ref == github.event.repository.default_branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -579,12 +582,13 @@ jobs:
 
       - name: Compose full release body
         env:
-          GH_TOKEN:           ${{ github.token }}
-          INSTALLER_REF:      ${{ needs.resolve.outputs.installer_ref }}
-          DEPENDENCY_BRANCH:  ${{ needs.resolve.outputs.dependency_branch }}
-          RELEASE_TYPE:       ${{ needs.resolve.outputs.release_type }}
-          IS_PRERELEASE:      ${{ needs.resolve.outputs.prerelease }}
-          BUILT_AT:           ${{ steps.built-at.outputs.value }}
+          GH_TOKEN:                ${{ github.token }}
+          INSTALLER_REF:           ${{ needs.resolve.outputs.installer_ref }}
+          DEPENDENCY_BRANCH:       ${{ needs.resolve.outputs.dependency_branch }}
+          RELEASE_TYPE:            ${{ needs.resolve.outputs.release_type }}
+          IS_PRERELEASE:           ${{ needs.resolve.outputs.prerelease }}
+          BUILT_AT:                ${{ steps.built-at.outputs.value }}
+          CANONICAL_INSTALLER_REF: ${{ github.event.repository.default_branch }}
         run: bash scripts/compose-release-body.sh
 
       - name: Publish release
