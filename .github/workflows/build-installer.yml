@@ -141,7 +141,28 @@ jobs:
       # BuroHappold_Installer (which bundles private BHE repos), add the
       # mint-dep-token step here.
 
+      - name: Restore build-tools cache (WiX + net40 ref assemblies)
+        # Caches the two pieces of external tooling the build job sets up on
+        # every run: WiX Toolset v3.11.2 (choco-installed) and the .NET
+        # Framework 4.0 reference-assembly targeting pack (nuget + manual
+        # copy). Both are version-pinned and the steps that produce them
+        # take 1-2 minutes combined on a cold runner — including the
+        # occasional multi-minute choco-mirror stall observed on 2026-06-17.
+        # Cache hit skips both installs and goes straight to env-var setup.
+        # Cache key bumps when WiX version, net40-refs version, or runner
+        # image changes; manual invalidation by bumping the trailing -vN.
+        # BHoM dependency repos are NOT cached here — they are cloned and
+        # built fresh per dispatch by Build-Installer.ps1.
+        id: tools-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0
+            C:\Program Files (x86)\WiX Toolset v3.11
+          key: build-tools-${{ runner.os }}-wix3.11.2-net40refs1.0.3-v1
+
       - name: Provide .NET Framework 4.0 reference assemblies
+        if: steps.tools-cache.outputs.cache-hit != 'true'
         # InstallerCA.csproj targets .NET Framework v4.0, matching BHoMBot's
         # build exactly so that the installer source tree stays untouched. The
         # windows-2025-vs2026 image ships no v4.0 targeting pack, so MSBuild
@@ -181,6 +202,7 @@ jobs:
           Get-ChildItem $dst -Filter '*.dll' | Measure-Object | ForEach-Object { Write-Host "  $($_.Count) DLLs present" }
 
       - name: Pin WiX Toolset v3.11.2
+        if: steps.tools-cache.outputs.cache-hit != 'true'
         # GHA windows-2025-vs2026 ships WiX v3.14. The v3.14 SfxCA.dll stub
         # (bundled by MakeSfxCA into InstallerCA.CA.dll) appears to be the
         # source of "SFXCA: Failed to create temp directory. Error code 5"
@@ -206,8 +228,16 @@ jobs:
           Write-Host "=== WiX directories on runner (after) ==="
           Get-ChildItem 'C:\Program Files (x86)' -Filter 'WiX*' -Directory | Select-Object FullName | Format-Table -AutoSize | Out-String | Write-Host
 
+      - name: Configure WiX env vars
+        # GITHUB_ENV and GITHUB_PATH exports do not survive across step
+        # boundaries on a cache HIT (the install step that previously set
+        # them is skipped). Resolve the WiX root from disk and export
+        # WIX + PATH unconditionally so downstream MSBuild and candle/light
+        # invocations resolve the pinned v3.11.2 binaries regardless of
+        # whether the cache hit or missed.
+        run: |
           $wixRoot = Get-ChildItem 'C:\Program Files (x86)' -Filter 'WiX Toolset v3.11*' -Directory -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $wixRoot) { throw "WiX 3.11 install did not produce expected path under C:\Program Files (x86)" }
+          if (-not $wixRoot) { throw "WiX 3.11 install missing under C:\Program Files (x86) (cache restore failed or install step did not run)" }
           $wixBin = Join-Path $wixRoot 'bin'
           if (-not (Test-Path $wixBin)) { throw "WiX 3.11 install missing bin\: $wixBin" }
 
