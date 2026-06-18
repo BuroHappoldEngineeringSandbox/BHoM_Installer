@@ -268,7 +268,7 @@ jobs:
 
       - name: Upload full-history result
         if: always() && steps.target.outputs.skip == 'false'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: versioning-fullhistory-${{ github.run_id }}
           path: ${{ github.workspace }}/Build/versioning-fullhistory.json
@@ -277,7 +277,7 @@ jobs:
 
       - name: Upload install log on failure
         if: failure() && steps.target.outputs.skip == 'false'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: msiexec-install-log-${{ github.run_id }}
           path: install.log
