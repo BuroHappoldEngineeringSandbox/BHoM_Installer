@@ -232,17 +232,16 @@ resolve_main() {
             dependency_branch=develop
             prerelease=true
             make_latest=false
-            # Rule 3 is SOFT for scheduled nightlies: if v{M}.{N}.0 has already
-            # shipped on this line, we still run build + install-test (smoke
-            # preserved) but skip publish and emit a wixproj-bump warning.
-            # The dispatched paths below treat rule 3 as a hard fail because
-            # a human deliberately initiated those runs.
-            if assert_no_shipped_release_for "$wix_m" "$wix_n" 2>/dev/null; then
-                release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
-            else
-                should_publish=false
-                release_tag=""
-                printf '::warning title=Wixproj bump needed::v%s.%s.0-beta already shipped on this line. Bump BHoM_Installer.wixproj MinorVersion (or MajorVersion) on develop before the next nightly so it can publish.\n' "$wix_m" "$wix_n" >&2
+            release_tag=""
+            should_publish=false
+            # Alpha is build + smoke-test only under the perpetual-pre-release
+            # model: no git tag, no GitHub Release, no public artefact beyond
+            # the workflow's own retained .msi. Rule 3 still hard-fails on
+            # alpha-beta and beta dispatches against a shipped line; here on
+            # the schedule path we surface a passive notice so coordinators
+            # eventually trigger the next minor's wixproj bump.
+            if ! assert_no_shipped_release_for "$wix_m" "$wix_n" 2>/dev/null; then
+                printf '::notice title=Wixproj bump candidate::v%s.%s.0-beta is shipped on this line. Bump BHoM_Installer.wixproj MinorVersion when starting the next minor.\n' "$wix_m" "$wix_n" >&2
             fi
             # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
             ;;
@@ -257,11 +256,15 @@ resolve_main() {
 
             case "$release_type" in
                 alpha)
-                    assert_no_shipped_release_for "$wix_m" "$wix_n" || return 2
-                    release_tag=$(compute_alpha_tag "$wix_m" "$wix_n" "$today")
-                    # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
+                    # No publish under the new model — rule 3 unnecessary
+                    # because rule 3 prevents pre-releases against a shipped
+                    # line, and alpha never releases. Build runs and uploads
+                    # an artefact regardless of develop state.
+                    release_tag=""
                     prerelease=true
                     make_latest=false
+                    should_publish=false
+                    # msi_patch_version="" — Build-Installer.ps1 defaults to yyMMdd.
                     ;;
                 alpha-beta)
                     warn_non_conventional_dependency_branch alpha-beta "$dependency_branch"
@@ -514,17 +517,18 @@ EOF
     export WIXPROJ_PATH="$wixproj_tmp"
     export TODAY_OVERRIDE="260605"
 
-    # Schedule -> alpha pre-release for today.
+    # Schedule -> alpha smoke build, never publishes.
     export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/develop \
         INPUT_RELEASE_TYPE="" INPUT_DEPENDENCY_BRANCH=""
     local out; out=$(lookup_tags()    { :; }; \
                      lookup_releases(){ :; }; \
                      resolve_main 2>/dev/null)
-    assert_equal "schedule -> release_type=alpha"     "alpha"                "$(echo "$out" | grep '^release_type='      | cut -d= -f2)"
-    assert_equal "schedule -> dependency_branch=develop"  "develop"          "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
-    assert_equal "schedule -> prerelease=true"        "true"                 "$(echo "$out" | grep '^prerelease='        | cut -d= -f2)"
-    assert_equal "schedule -> make_latest=false"      "false"                "$(echo "$out" | grep '^make_latest='       | cut -d= -f2)"
-    assert_equal "schedule -> release_tag computed"   "v9.2.0-alpha.260605"  "$(echo "$out" | grep '^release_tag='       | cut -d= -f2)"
+    assert_equal "schedule -> release_type=alpha"        "alpha"   "$(echo "$out" | grep '^release_type='      | cut -d= -f2)"
+    assert_equal "schedule -> dependency_branch=develop" "develop" "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
+    assert_equal "schedule -> prerelease=true"           "true"    "$(echo "$out" | grep '^prerelease='        | cut -d= -f2)"
+    assert_equal "schedule -> make_latest=false"         "false"   "$(echo "$out" | grep '^make_latest='       | cut -d= -f2)"
+    assert_equal "schedule -> release_tag empty"         ""        "$(echo "$out" | grep '^release_tag='       | cut -d= -f2)"
+    assert_equal "schedule -> should_publish=false"      "false"   "$(echo "$out" | grep '^should_publish='    | cut -d= -f2)"
 
     # workflow_dispatch alpha-beta -> alpha-beta pre-release. Convention path: dependency_branch=develop.
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
@@ -681,7 +685,8 @@ EOF
         *) assert_equal "alpha + dep_branch=main does NOT warn" "ok" "ok" ;;
     esac
 
-    # schedule when v9.2.0-beta already shipped -> rule 3 SOFT: should_publish=false.
+    # schedule when v9.2.0-beta already shipped -> still should_publish=false
+    # (alpha never publishes), and a wixproj-bump notice fires on stderr.
     export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/develop \
         INPUT_RELEASE_TYPE="" INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
@@ -694,34 +699,60 @@ EOF
     assert_equal "schedule + v9.2.0-beta shipped -> release_type still alpha" "alpha" \
         "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
 
-    # And the warning is on stderr; the exit code is 0 (soft, not hard).
+    # Bump-candidate notice on stderr; exit code 0 (alpha never errors on rule 3).
     local err_out
     err_out=$(lookup_tags()    { :; }; \
               lookup_releases(){ printf '%s\n' "v9.2.0-beta"; }; \
               resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$err_out" in
-        *"Wixproj bump needed"*"exit=0") assert_equal "rule 3 soft on schedule emits warning, exits 0" "ok" "ok" ;;
-        *) assert_equal "rule 3 soft on schedule emits warning, exits 0" "ok" "got: $err_out" ;;
+        *"Wixproj bump candidate"*"exit=0") assert_equal "schedule + shipped line: bump-candidate notice, exits 0" "ok" "ok" ;;
+        *) assert_equal "schedule + shipped line: bump-candidate notice, exits 0" "ok" "got: $err_out" ;;
     esac
 
-    # Dispatched alpha when v9.2.0-beta shipped -> rule 3 HARD (user explicit).
+    # Schedule on a clean line (no shipped release) emits no bump-candidate notice.
+    err_out=$(lookup_tags()    { :; }; \
+              lookup_releases(){ :; }; \
+              resolve_main 2>&1 >/dev/null; echo "exit=$?")
+    case "$err_out" in
+        *"Wixproj bump candidate"*) assert_equal "schedule + clean line: NO bump-candidate notice" "silent" "got notice: $err_out" ;;
+        *"exit=0") assert_equal "schedule + clean line: NO bump-candidate notice" "silent" "silent" ;;
+        *) assert_equal "schedule + clean line: NO bump-candidate notice" "silent" "got: $err_out" ;;
+    esac
+
+    # Dispatched alpha when v9.2.0-beta shipped -> alpha no longer publishes,
+    # rule 3 no longer applies to alpha; resolve succeeds with should_publish=false.
     export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
         INPUT_RELEASE_TYPE=alpha INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ printf '%s\n' "v9.2.0-beta"; }; \
+          resolve_main 2>/dev/null)
+    assert_equal "dispatch alpha + v9.2.0-beta shipped -> resolve succeeds" "alpha" \
+        "$(echo "$out" | grep '^release_type=' | cut -d= -f2)"
+    assert_equal "dispatch alpha + v9.2.0-beta shipped -> should_publish=false" "false" \
+        "$(echo "$out" | grep '^should_publish=' | cut -d= -f2)"
+    assert_equal "dispatch alpha + v9.2.0-beta shipped -> release_tag empty" "" \
+        "$(echo "$out" | grep '^release_tag=' | cut -d= -f2)"
+
+    # Dispatched alpha-beta when v9.2.0-beta shipped -> rule 3 STILL HARD-fails
+    # (the publish path remains gated for pre-release tiers other than alpha).
+    export GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/develop \
+        INPUT_RELEASE_TYPE=alpha-beta INPUT_DEPENDENCY_BRANCH=develop INPUT_DEFAULT_BRANCH=develop
+    out=$(lookup_tags()    { :; }; \
+          lookup_releases(){ printf '%s\n' "v9.2.0-beta"; }; \
           resolve_main 2>&1 >/dev/null; echo "exit=$?")
     case "$out" in
-        *"already been released"*"exit=2") assert_equal "rule 3 hard on alpha dispatch when v9.2.0-beta shipped" "ok" "ok" ;;
-        *) assert_equal "rule 3 hard on alpha dispatch when v9.2.0-beta shipped" "ok" "got: $out" ;;
+        *"already been released"*"exit=2") assert_equal "rule 3 still hard on alpha-beta dispatch when v9.2.0-beta shipped" "ok" "ok" ;;
+        *) assert_equal "rule 3 still hard on alpha-beta dispatch when v9.2.0-beta shipped" "ok" "got: $out" ;;
     esac
 
-    # Default schedule (no shipped release) -> should_publish=true.
+    # Default schedule (no shipped release) -> still should_publish=false
+    # (alpha never publishes, irrespective of line state).
     export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/develop \
         INPUT_RELEASE_TYPE="" INPUT_DEPENDENCY_BRANCH=""
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "schedule + no shipped release -> should_publish=true" "true" \
+    assert_equal "schedule + clean line -> should_publish=false (alpha never publishes)" "false" \
         "$(echo "$out" | grep '^should_publish=' | cut -d= -f2)"
     assert_equal "schedule -> wix_major=9 wix_minor=2 surfaced" "9 2" \
         "$(echo "$out" | grep -E '^wix_(major|minor)=' | cut -d= -f2 | xargs)"
