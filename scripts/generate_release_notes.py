@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate Markdown release notes for the BHoM nightly-alpha release.
+Generate Markdown release notes for a BHoM installer release.
 
 Diffs the current build's per-dep manifest against the previous release's
-manifest and renders, per changed dep:
-  - PRs merged in the range (linked, with author handle)
-  - Direct commits not associated with any PR (fallback section)
+manifest and renders a categorised changelog: every PR merged across all
+changed deps is grouped by its first matching `type:*` label, with the
+source dep name prefixed inline ('[Repo_Name] PR title (#NNN, @author)').
+Categories render in a fixed order (Breaking Changes first, then Features,
+Bug Fixes, etc.); commits without a PR or labelled PRs without a `type:*`
+fall under "Other Changes". Per-category cap keeps the body under GitHub's
+125 KB release-body limit on large diff ranges.
 
 For an initial publish (no previous manifest), lists every dep with its
 current tip SHA so subsequent diffs have a baseline.
@@ -15,6 +19,7 @@ Inputs:
   argv[2]: path to previous dep-manifest.json (optional). Pass an empty
            string or omit for an initial publish.
   argv[3]: output Markdown path (defaults to release-notes-section.md)
+  argv[4]: anchor tag for the diff heading (e.g. 'v9.1.0-beta'). Optional.
 
 Environment:
   GH_TOKEN: a token with read access to every dep repo's commits/PRs.
@@ -25,8 +30,7 @@ Manifest schema (version 1):
   {
     "version":      1,
     "built_at":     "ISO8601",
-    "release_type": "alpha"|"beta",
-    "main_branch":  "develop",
+    "release_type": "alpha"|"alpha-beta"|"beta",
     "deps": {
       "<owner>/<repo>": { "branch": "develop", "sha": "<40-char>" },
       ...
@@ -80,6 +84,52 @@ def short(sha: str) -> str:
     return sha[:7] if sha else ""
 
 
+def repo_short(repo: str) -> str:
+    """'BHoM/Revit_Toolkit' -> 'Revit_Toolkit'."""
+    return repo.split("/", 1)[-1] if "/" in repo else repo
+
+
+# Category mapping. Order is canonical: a PR with multiple `type:*` labels is
+# assigned to the first match in this dict. `type:question` is intentionally
+# not mapped — questions track issues, not changes that ship. PRs with no
+# `type:*` label, and commits not associated with any merged PR, fall under
+# "Other Changes".
+TYPE_LABEL_TO_CATEGORY: dict[str, str] = {
+    "type:external-api-changes": "Breaking Changes",
+    "type:feature":              "Features",
+    "type:bug":                  "Bug Fixes",
+    "type:user-experience":      "UX Improvements",
+    "type:compliance":           "Compliance",
+    "type:documentation":        "Documentation",
+    "type:test-script":          "Tests",
+}
+
+CATEGORY_ORDER: list[str] = [
+    "Breaking Changes",
+    "Features",
+    "Bug Fixes",
+    "UX Improvements",
+    "Compliance",
+    "Documentation",
+    "Tests",
+    "Other Changes",
+]
+
+# Per-category cap. Entries beyond this on a single category overflow into a
+# "...and N more" note rather than expanding the release body beyond GitHub's
+# 125 KB limit on dep ranges that span many minor releases.
+CATEGORY_CAP = 30
+
+
+def categorise_pr(pr: dict) -> str:
+    """Return the category header for a PR based on its first type:* label."""
+    label_names = {lbl.get("name", "") for lbl in pr.get("labels") or []}
+    for label, category in TYPE_LABEL_TO_CATEGORY.items():
+        if label in label_names:
+            return category
+    return "Other Changes"
+
+
 def render_initial_notes(curr: dict) -> str:
     n = len(curr.get("deps", {}))
     return (
@@ -92,87 +142,98 @@ def render_initial_notes(curr: dict) -> str:
     )
 
 
-def render_dep_changes(repo: str, prev_sha: str, curr_sha: str) -> list[str]:
-    """Render the section for one changed dep."""
-    cmp_data = api(f"repos/{repo}/compare/{prev_sha}...{curr_sha}")
-    header_range = f"`{short(prev_sha)}...{short(curr_sha)}`"
+def collect_dep_entries(repo: str, prev_sha: str, curr_sha: str) -> list[dict]:
+    """Walk the commit range for one dep and emit a flat list of entries.
 
+    Each entry is one of:
+      {kind: "pr",         repo, pr}      — a merged PR (carries its labels)
+      {kind: "direct",     repo, sha, message, author}
+                                         — a commit not associated with a PR
+      {kind: "force_push", repo, prev_sha, curr_sha}
+                                         — compare API returned no data
+    Merge commits are skipped (the underlying PR carries the same content).
+    """
+    cmp_data = api(f"repos/{repo}/compare/{prev_sha}...{curr_sha}")
     if cmp_data is None:
-        return [
-            f"#### {repo} {header_range}",
-            "",
-            f"_Commit range could not be resolved, possibly due to a force-push on the branch. "
-            f"[Compare on GitHub](https://github.com/{repo}/compare/{prev_sha}...{curr_sha})._",
-            "",
-        ]
+        return [{
+            "kind": "force_push",
+            "repo": repo,
+            "prev_sha": prev_sha,
+            "curr_sha": curr_sha,
+        }]
 
     commits = cmp_data.get("commits", [])
     if not commits:
-        return [
-            f"#### {repo} {header_range}",
-            "",
-            "_No commits in range._",
-            "",
-        ]
+        return []
 
-    # Collect unique PRs and any direct (non-merge, non-PR) commits.
     seen_pr_numbers: set[int] = set()
-    prs: list[dict] = []
-    direct: list[dict] = []
+    entries: list[dict] = []
 
     for c in commits:
         if len(c.get("parents", [])) > 1:
-            # Skip merge commits. Their content is reflected via the PR.
-            continue
+            continue  # skip merge commits; PR entry covers their content
         sha = c["sha"]
         commit_prs = api(f"repos/{repo}/commits/{sha}/pulls") or []
         merged_prs = [p for p in commit_prs if p.get("merged_at")]
-
         if merged_prs:
             for pr in merged_prs:
-                if pr["number"] not in seen_pr_numbers:
-                    seen_pr_numbers.add(pr["number"])
-                    prs.append(pr)
+                if pr["number"] in seen_pr_numbers:
+                    continue
+                seen_pr_numbers.add(pr["number"])
+                entries.append({"kind": "pr", "repo": repo, "pr": pr})
         else:
-            direct.append({
-                "sha": sha,
+            entries.append({
+                "kind":    "direct",
+                "repo":    repo,
+                "sha":     sha,
                 "message": c["commit"]["message"].split("\n", 1)[0],
-                "author": c["commit"]["author"]["name"],
+                "author":  c["commit"]["author"]["name"],
             })
 
-    # Header line summarising the contents of this section.
-    bits: list[str] = []
-    if prs:
-        s = "s" if len(prs) > 1 else ""
-        bits.append(f"{len(prs)} PR{s} merged")
-    if direct:
-        s = "s" if len(direct) > 1 else ""
-        bits.append(f"{len(direct)} direct commit{s}")
-    if not bits:
-        # No non-merge commits; only merge commits. Should be rare.
-        bits.append(f"{len(commits)} commits")
+    return entries
 
-    out = [f"#### {repo} {header_range}: {', '.join(bits)}", ""]
 
-    # Cap per-repository entries to keep release bodies under GitHub's 125 KB limit.
-    PR_CAP = 30
-    for pr in prs[:PR_CAP]:
+def render_entry(entry: dict) -> str:
+    """Render one entry as a markdown bullet."""
+    r = repo_short(entry["repo"])
+    if entry["kind"] == "pr":
+        pr = entry["pr"]
         author = (pr.get("user") or {}).get("login", "?")
-        out.append(f"- [#{pr['number']}]({pr['html_url']}): {pr['title']} (@{author})")
-    if len(prs) > PR_CAP:
-        out.append(f"- _...and {len(prs) - PR_CAP} more._")
+        return f"- [{r}] [{pr['title']}]({pr['html_url']}) (#{pr['number']}, @{author})"
+    if entry["kind"] == "direct":
+        return f"- [{r}] {entry['message']} ({entry['author']}) `{short(entry['sha'])}`"
+    # force_push
+    return (
+        f"- [{r}] _commit range `{short(entry['prev_sha'])}...{short(entry['curr_sha'])}` "
+        f"could not be resolved (force-push?). "
+        f"[Compare]({'https://github.com/' + entry['repo'] + '/compare/' + entry['prev_sha'] + '...' + entry['curr_sha']})._"
+    )
 
-    if direct:
-        if prs:
-            out.append("")
-            out.append("_Direct commits (not associated with a merged PR):_")
-        for d in direct[:PR_CAP]:
-            out.append(f"- {d['message']} ({d['author']}) `{short(d['sha'])}`")
-        if len(direct) > PR_CAP:
-            out.append(f"- _...and {len(direct) - PR_CAP} more._")
 
-    out.append("")
-    return out
+def render_categorised(all_entries: list[dict]) -> list[str]:
+    """Group entries by category and render each category section."""
+    by_category: dict[str, list[dict]] = {cat: [] for cat in CATEGORY_ORDER}
+    for entry in all_entries:
+        if entry["kind"] == "pr":
+            by_category[categorise_pr(entry["pr"])].append(entry)
+        else:
+            # Direct commits and force-push markers have no PR label; bucket
+            # them under Other Changes so they still surface.
+            by_category["Other Changes"].append(entry)
+
+    lines: list[str] = []
+    for category in CATEGORY_ORDER:
+        entries = by_category[category]
+        if not entries:
+            continue
+        lines.append(f"#### {category}")
+        lines.append("")
+        for entry in entries[:CATEGORY_CAP]:
+            lines.append(render_entry(entry))
+        if len(entries) > CATEGORY_CAP:
+            lines.append(f"- _...and {len(entries) - CATEGORY_CAP} more in this category._")
+        lines.append("")
+    return lines
 
 
 def render_diff_notes(prev: dict, curr: dict, anchor_tag: str = "") -> str:
@@ -201,21 +262,28 @@ def render_diff_notes(prev: dict, curr: dict, anchor_tag: str = "") -> str:
         lines.append("")
         return "\n".join(lines)
 
+    # Collect entries across all changed deps, then render in flat
+    # categorised form (Breaking Changes / Features / Bug Fixes / ...).
+    all_entries: list[dict] = []
     for repo, p_sha, c_sha in changed:
-        lines.extend(render_dep_changes(repo, p_sha, c_sha))
+        all_entries.extend(collect_dep_entries(repo, p_sha, c_sha))
 
-    for repo in added:
-        info = curr_deps[repo]
-        lines.append(f"#### Newly included: {repo} `{short(info.get('sha', ''))}`")
+    if all_entries:
+        lines.extend(render_categorised(all_entries))
+
+    if added:
+        lines.append("#### Newly Included Dependencies")
         lines.append("")
-        lines.append("_No prior version exists for comparison._")
+        for repo in added:
+            info = curr_deps[repo]
+            lines.append(f"- {repo_short(repo)} `{short(info.get('sha', ''))}` _(no prior version)_")
         lines.append("")
 
     if removed:
-        lines.append("### Removed from build")
+        lines.append("#### Removed From Build")
         lines.append("")
         for repo in removed:
-            lines.append(f"- {repo} (was at `{short(prev_deps[repo].get('sha', ''))}`)")
+            lines.append(f"- {repo_short(repo)} _(was at `{short(prev_deps[repo].get('sha', ''))}`)_")
         lines.append("")
 
     lines.append(f"_{unchanged} of {total} dependencies unchanged since the previous release._")
