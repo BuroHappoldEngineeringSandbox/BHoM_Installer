@@ -79,10 +79,8 @@ read_wixproj_version() {
     [ -f "$file" ] || { err "wixproj file not found: $file"; return 3; }
 
     local major minor
-    major=$(grep -oE '<MajorVersion[^>]*>[0-9]+</MajorVersion>' "$file" \
-            | grep -oE '>[0-9]+<' | tr -d '><' | head -n1)
-    minor=$(grep -oE '<MinorVersion[^>]*>[0-9]+</MinorVersion>' "$file" \
-            | grep -oE '>[0-9]+<' | tr -d '><' | head -n1)
+    major=$(sed -nE 's|.*<MajorVersion[^>]*>([0-9]+)</MajorVersion>.*|\1|p' "$file" | head -n1)
+    minor=$(sed -nE 's|.*<MinorVersion[^>]*>([0-9]+)</MinorVersion>.*|\1|p' "$file" | head -n1)
 
     [ -n "$major" ] || { err "MajorVersion not found in $file"; return 3; }
     [ -n "$minor" ] || { err "MinorVersion not found in $file"; return 3; }
