@@ -8,22 +8,34 @@
 # later, independently. The signal is about assemblies, not about packaging.
 #
 # Trigger model:
-#   release (published)  Auto-fires when a GitHub Release is published.
-#                        Self-filters to alpha-beta and beta tiers because
-#                        alpha builds no longer publish a Release (see
-#                        build-installer.yml, PR #34). The just-published
-#                        tag is read from github.event.release.tag_name.
-#   workflow_dispatch    Ad-hoc, with optional overrides:
-#                        - versioning_toolkit_repo: fork override for the
-#                          repo containing .ci/code/Verification.sln
-#                        - test_toolkit_repo: fork override
-#                        - additional_dataset_repos: newline-separated extra
-#                          dataset-source repos to clone and build, so their
-#                          PostBuildEvents stage supplementary datasets
-#                          alongside Versioning_Toolkit's own
-#                        - release_tag: validate a specific historical release
-#                          instead of the latest. Useful for retrospective
-#                          regression-hunting on shipped builds.
+#   workflow_dispatch    The only declared trigger. Used in two modes.
+#
+#                        Auto-fired by build-installer.yml's publish job
+#                        immediately after a successful alpha-beta or
+#                        beta release. The publish job sets release_tag
+#                        to the just-published tag. The chain is wired
+#                        as an explicit workflow_dispatch (not a
+#                        release: published trigger) because Releases
+#                        created by softprops/action-gh-release are
+#                        authored by GITHUB_TOKEN, and GITHUB_TOKEN-
+#                        authored events do not chain to downstream
+#                        workflows (GitHub's loop-protection).
+#                        workflow_dispatch is the exempt trigger.
+#
+#                        Ad-hoc from the Actions UI with optional
+#                        overrides:
+#                          - versioning_toolkit_repo: fork override for
+#                            the repo containing .ci/code/Verification.sln
+#                          - test_toolkit_repo: fork override
+#                          - additional_dataset_repos: newline-separated
+#                            extra dataset-source repos to clone and
+#                            build, so their PostBuildEvents stage
+#                            supplementary datasets alongside
+#                            Versioning_Toolkit's own
+#                          - release_tag: validate a specific historical
+#                            release instead of the latest. Useful for
+#                            retrospective regression-hunting on shipped
+#                            builds.
 #
 # Retrospective replay (release_tag input):
 #   When release_tag is set, the workflow validates that specific .msi
@@ -95,8 +107,6 @@ on:
         type: string
         required: false
         default: ''
-  release:
-    types: [published]
 
 permissions:
   contents: read
@@ -119,11 +129,7 @@ jobs:
         id: target
         env:
           GH_TOKEN: ${{ github.token }}
-          # On release events, the just-published tag is in github.event.release.
-          # On workflow_dispatch, inputs.release_tag is either set explicitly or
-          # left blank to mean "latest published". The fallback inside the
-          # script handles the latest-published case.
-          INPUT_RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           $tag = $env:INPUT_RELEASE_TAG
           if (-not $tag) {
