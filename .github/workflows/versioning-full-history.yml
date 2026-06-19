@@ -40,6 +40,12 @@
 # Infrastructure-only failure paths (clone fail, msi download fail, etc.)
 # still emit ::warning:: and exit 0 so they do not flap the badge on
 # transient issues.
+#
+# Extending this workflow for another org (e.g. BHE's BuroHappold_Installer,
+# or any third-party fork): see docs/extending.md. In particular, the
+# additional_dataset_repos input is the canonical mechanism for wiring in
+# private dataset sources (Revit API mocks, BHE-only toolkits, etc.) without
+# modifying this file. Defaults in this workflow MUST stay BHoM-org-neutral.
 
 name: Versioning (Full History)
 
