@@ -174,6 +174,34 @@ jobs:
           $dllCount = (Get-ChildItem $assembliesDir -Filter '*.dll' -ErrorAction SilentlyContinue | Measure-Object).Count
           Write-Host "::notice title=Full-history versioning::Installed. Assemblies in ${assembliesDir}: $dllCount DLLs."
 
+      - name: Sanity-check Assemblies population
+        if: steps.target.outputs.skip == 'false'
+        run: |
+          # Defends against silent partial-install: msiexec returned 0 but the
+          # .msi was missing dep payloads (or a packaging-side PostBuildEvent
+          # failed to stage them at build time). VersioningRunner would
+          # otherwise reflect over an incomplete set and report "no failures"
+          # because the types it expected to test simply are not loaded —
+          # giving a misleading green run.
+          #
+          # Filter mirrors VersioningRunner's own assembly-suffix rules
+          # (oM/_Engine/_Adapter, plus Revit-versioned). Test_*.dll excluded
+          # because it is staged by a later step, not by the .msi install.
+          # Floor (20) is conservative against current BHoM dep counts (~38
+          # in recent manifests; each typically contributes 1-3 BHoM DLLs).
+          # Lifting the floor over time is reasonable as BHoM grows; do not
+          # tie it directly to the dep manifest because that couples this
+          # workflow to packaging-side schema.
+          $bhomDlls = @(Get-ChildItem 'C:\ProgramData\BHoM\Assemblies' -Filter '*.dll' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '(oM|_Engine|_Adapter)\.dll$' -or $_.Name -match 'Revit_\w+20\d{2}\.dll$' })
+          $count = $bhomDlls.Count
+          $floor = 20
+          Write-Host "::notice title=Full-history versioning::BHoM dep DLLs in Assemblies: $count (floor: $floor)."
+          if ($count -lt $floor) {
+              Write-Host "::error title=Full-history versioning::Assemblies appears incomplete ($count BHoM-suffix DLLs, expected at least $floor). The .msi install may have been partial, or a packaging-side PostBuildEvent may have silently failed. Aborting before versioning to avoid a misleading green run."
+              exit 1
+          }
+
       - name: Clone Versioning_Toolkit + Test_Toolkit
         if: steps.target.outputs.skip == 'false'
         env:
