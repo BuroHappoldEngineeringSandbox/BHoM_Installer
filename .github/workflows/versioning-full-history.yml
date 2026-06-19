@@ -20,7 +20,13 @@
 #
 # Trigger model (current):
 #   workflow_dispatch  Ad-hoc, with optional overrides:
+#                        - versioning_toolkit_repo: fork override for the
+#                          repo containing .ci/code/Verification.sln
 #                        - test_toolkit_repo: fork override
+#                        - additional_dataset_repos: newline-separated extra
+#                          dataset-source repos to clone and build, so their
+#                          PostBuildEvents stage supplementary datasets
+#                          alongside Versioning_Toolkit's own
 #                        - release_tag: validate a specific historical release
 #                          instead of the latest. Useful for retrospective
 #                          regression-hunting on shipped builds.
@@ -35,6 +41,15 @@ name: Versioning (Full History)
 on:
   workflow_dispatch:
     inputs:
+      versioning_toolkit_repo:
+        description: |
+          Repo containing Versioning_Toolkit (owner/repo). Must expose
+          .ci/code/Verification.sln whose PostBuildEvent stages historical
+          datasets to C:\ProgramData\BHoM\Datasets\TestSets\Versioning.
+          Mirrors the input of the same name on ci-versioning.yml.
+        type: string
+        required: false
+        default: 'BHoM/Versioning_Toolkit'
       test_toolkit_repo:
         description: |
           Repo containing Test_Toolkit (owner/repo). Override to point at a
@@ -44,6 +59,18 @@ on:
         type: string
         required: false
         default: 'BHoM/Test_Toolkit'
+      additional_dataset_repos:
+        description: |
+          Newline-separated list of additional repos (owner/repo) to clone
+          and build before running tests. Each repo's .ci/code/Verification.sln
+          PostBuildEvent stages supplementary versioning datasets alongside
+          the primary Versioning_Toolkit's. Mirrors the input of the same
+          name on ci-versioning.yml. Use this to stage datasets from a
+          private or org-specific dataset source (e.g. a Revit API mock fork
+          maintained outside the BHoM org).
+        type: string
+        required: false
+        default: ''
       release_tag:
         description: |
           Validate a specific release tag (e.g. v9.2.0-alpha.260615) instead
@@ -145,7 +172,8 @@ jobs:
       - name: Clone Versioning_Toolkit + Test_Toolkit
         if: steps.target.outputs.skip == 'false'
         env:
-          TEST_TOOLKIT_REPO: ${{ inputs.test_toolkit_repo || 'BHoM/Test_Toolkit' }}
+          VERSIONING_TOOLKIT_REPO: ${{ inputs.versioning_toolkit_repo || 'BHoM/Versioning_Toolkit' }}
+          TEST_TOOLKIT_REPO:       ${{ inputs.test_toolkit_repo || 'BHoM/Test_Toolkit' }}
         run: |
           # Versioning_Toolkit provides .ci/code/Verification.sln and the
           # historical datasets. Test_Toolkit provides Test_Engine.dll and
@@ -156,9 +184,10 @@ jobs:
           $codeLocation = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force -Path $codeLocation | Out-Null
 
-          git clone --depth 1 --branch develop https://github.com/BHoM/Versioning_Toolkit.git "$codeLocation\Versioning_Toolkit" 2>&1 | ForEach-Object { Write-Host "  $_" }
+          $vtkName = ($env:VERSIONING_TOOLKIT_REPO -split '/')[1]
+          git clone --depth 1 --branch develop "https://github.com/$($env:VERSIONING_TOOLKIT_REPO).git" "$codeLocation\$vtkName" 2>&1 | ForEach-Object { Write-Host "  $_" }
           if ($LASTEXITCODE -ne 0) {
-              Write-Host "::warning title=Full-history versioning::Versioning_Toolkit clone failed (exit $LASTEXITCODE). Skipping."
+              Write-Host "::warning title=Full-history versioning::Versioning_Toolkit clone failed for '$($env:VERSIONING_TOOLKIT_REPO)' (exit $LASTEXITCODE). Skipping."
               exit 0
           }
 
@@ -203,10 +232,72 @@ jobs:
           $staged = Get-ChildItem 'C:\ProgramData\BHoM\Assemblies' -Filter 'Test_*.dll' -ErrorAction SilentlyContinue
           Write-Host "::notice title=Full-history versioning::Test_Toolkit staged. Test_*.dll in Assemblies: $($staged.Count)"
 
+      - name: Build additional dataset repos (stage supplementary datasets)
+        if: steps.target.outputs.skip == 'false' && inputs.additional_dataset_repos != ''
+        env:
+          ADDITIONAL_DATASET_REPOS: ${{ inputs.additional_dataset_repos }}
+        run: |
+          # Clone + build each additional repo's .ci/code/Verification.sln.
+          # PostBuildEvents stage extra historical datasets into
+          # C:\ProgramData\BHoM\Datasets\TestSets\Versioning alongside the
+          # primary Versioning_Toolkit's. Fail-soft per repo so a single
+          # missing or broken dep does not drop the whole run.
+
+          $repos = $env:ADDITIONAL_DATASET_REPOS -split "`n" |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { $_ -ne '' }
+
+          if ($repos.Count -eq 0) { return }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) {
+              Write-Host "::warning title=Full-history versioning::MSBuild not located via vswhere. Skipping additional dataset repos."
+              exit 0
+          }
+
+          foreach ($repo in $repos) {
+              $repoName = ($repo -split '/')[1]
+              if (-not $repoName) {
+                  Write-Host "::warning title=Full-history versioning::Skipping '$repo' — not in owner/repo format."
+                  continue
+              }
+
+              $repoDir = Join-Path $env:GITHUB_WORKSPACE $repoName
+              git clone --depth 1 --branch develop "https://github.com/$repo.git" $repoDir 2>&1 | ForEach-Object { Write-Host "  $_" }
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::warning title=Full-history versioning::Clone failed for '$repo'. Skipping."
+                  continue
+              }
+
+              $sln = Join-Path $repoDir '.ci\code\Verification.sln'
+              if (-not (Test-Path $sln)) {
+                  Write-Host "::warning title=Full-history versioning::'$repo' has no .ci\code\Verification.sln. Skipping."
+                  continue
+              }
+
+              & nuget restore $sln -Verbosity quiet
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::warning title=Full-history versioning::NuGet restore failed for '$repo'. Skipping build."
+                  continue
+              }
+
+              & $msbuild $sln -nologo -verbosity:minimal -p:Configuration=Release
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::warning title=Full-history versioning::MSBuild failed for '$repo'. Continuing without this dataset."
+                  continue
+              }
+
+              Write-Host "::notice title=Full-history versioning::Staged datasets from $repo."
+          }
+
       - name: Build Verification.sln
         if: steps.target.outputs.skip == 'false'
+        env:
+          VERSIONING_TOOLKIT_REPO: ${{ inputs.versioning_toolkit_repo || 'BHoM/Versioning_Toolkit' }}
         run: |
-          $verSln = Join-Path $env:GITHUB_WORKSPACE 'Versioning_Toolkit\.ci\code\Verification.sln'
+          $vtkName = ($env:VERSIONING_TOOLKIT_REPO -split '/')[1]
+          $verSln = Join-Path $env:GITHUB_WORKSPACE "$vtkName\.ci\code\Verification.sln"
           if (-not (Test-Path $verSln)) {
               Write-Host "::warning title=Full-history versioning::Verification.sln not found at $verSln. Skipping."
               exit 0
