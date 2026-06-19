@@ -7,19 +7,13 @@
 # `_testingTimer` ran the equivalent of `RunVersioning("full")` two hours
 # later, independently. The signal is about assemblies, not about packaging.
 #
-# CURRENTLY DORMANT (2026-06-15). The workflow ships with workflow_dispatch
-# only; no schedule trigger. The core logic is in place for ad-hoc dispatches
-# and as the design anchor, but the workflow does not auto-run while focus is
-# on installer-build optimisations. To re-enable nightly cadence, add back:
-#
-#     schedule:
-#       - cron: '0 2 * * *'   # 02:00 UTC, offset from the 00:45 UTC alpha
-#                             # build so the publish job finalises the
-#                             # release before this workflow looks for the
-#                             # latest .msi.
-#
-# Trigger model (current):
-#   workflow_dispatch  Ad-hoc, with optional overrides:
+# Trigger model:
+#   release (published)  Auto-fires when a GitHub Release is published.
+#                        Self-filters to alpha-beta and beta tiers because
+#                        alpha builds no longer publish a Release (see
+#                        build-installer.yml, PR #34). The just-published
+#                        tag is read from github.event.release.tag_name.
+#   workflow_dispatch    Ad-hoc, with optional overrides:
 #                        - versioning_toolkit_repo: fork override for the
 #                          repo containing .ci/code/Verification.sln
 #                        - test_toolkit_repo: fork override
@@ -90,6 +84,8 @@ on:
         type: string
         required: false
         default: ''
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -112,7 +108,11 @@ jobs:
         id: target
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          # On release events, the just-published tag is in github.event.release.
+          # On workflow_dispatch, inputs.release_tag is either set explicitly or
+          # left blank to mean "latest published". The fallback inside the
+          # script handles the latest-published case.
+          INPUT_RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           $tag = $env:INPUT_RELEASE_TAG
           if (-not $tag) {
