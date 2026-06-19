@@ -25,6 +25,17 @@
 #                          instead of the latest. Useful for retrospective
 #                          regression-hunting on shipped builds.
 #
+# Retrospective replay (release_tag input):
+#   When release_tag is set, the workflow validates that specific .msi
+#   instead of the latest. Versioning_Toolkit and Test_Toolkit are still
+#   cloned at develop, not at the release_tag's publish date. Releases
+#   are immutable and the test framework evolves additively (new datasets,
+#   new upgraders), so running today's framework against an older .msi
+#   surfaces latent regressions that the framework caught up to identify
+#   after the release shipped. The runner's IsFromLoadedNamespace filter
+#   scopes out tests for types the older .msi cannot load, so new-dataset
+#   noise is handled at runtime without false positives.
+#
 # Does not gate any PR (per the 2026-06-15 architecture review: full-history
 # is the ecosystem-wide catch-everything safety net, while the per-PR
 # Versioning check (CI_Toolkit/ci-versioning.yml) is the gating
