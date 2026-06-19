@@ -1,5 +1,7 @@
 # BHoM_Installer
 
+[![Versioning (Full History)](https://github.com/BuroHappoldEngineeringSandbox/BHoM_Installer/actions/workflows/versioning-full-history.yml/badge.svg)](https://github.com/BuroHappoldEngineeringSandbox/BHoM_Installer/actions/workflows/versioning-full-history.yml)
+
 This repo is part of the Buildings and Habitats object Model. 
 If you are new (_welcome!_  👋 😄)  a great place to start is on [bhom.xyz](https://bhom.xyz) or reading our [wiki here](https://bhom.xyz/documentation) including pages like the [Structure of the BHoM](https://bhom.xyz/documentation/Basics/Coding%20fundamentals/The-BHoM-code-organisation/) and [Using the BHoM](https://bhom.xyz/documentation/Basics/Using-the-BHoM/).
 
