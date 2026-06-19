@@ -31,10 +31,15 @@
 #                          instead of the latest. Useful for retrospective
 #                          regression-hunting on shipped builds.
 #
-# Non-blocking by design. Per the 2026-06-15 architecture review:
-# full-history is the ecosystem-wide catch-everything safety net; the per-PR
+# Does not gate any PR (per the 2026-06-15 architecture review: full-history
+# is the ecosystem-wide catch-everything safety net, while the per-PR
 # Versioning check (CI_Toolkit/ci-versioning.yml) is the gating
-# author-attributable signal.
+# author-attributable signal). However, the workflow itself fails when a
+# regression is detected, so its conclusion (and any status badge derived
+# from it) reflects the actual state of the most recent shipped artefact.
+# Infrastructure-only failure paths (clone fail, msi download fail, etc.)
+# still emit ::warning:: and exit 0 so they do not flap the badge on
+# transient issues.
 
 name: Versioning (Full History)
 
@@ -339,10 +344,9 @@ jobs:
           source_dir: tools/VersioningRunner/src
           dotnet_version: '8.0'
 
-      - name: Run versioning (full-history, fail-soft)
+      - name: Run versioning (full-history)
         id: fh-run
         if: steps.target.outputs.skip == 'false'
-        continue-on-error: true
         run: |
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\Build" | Out-Null
 
@@ -352,10 +356,10 @@ jobs:
               --output "$env:GITHUB_WORKSPACE\Build\versioning-fullhistory.json"
 
           if ($LASTEXITCODE -ne 0) {
-              Write-Host "::warning title=Full-history versioning::Regression detected (exit code $LASTEXITCODE). See the attached versioning-fullhistory-${{ github.run_id }} artefact."
-          } else {
-              Write-Host "::notice title=Full-history versioning::All historical dataset versions pass."
+              Write-Host "::error title=Full-history versioning::Regression detected (exit code $LASTEXITCODE). See the attached versioning-fullhistory-${{ github.run_id }} artefact."
+              exit $LASTEXITCODE
           }
+          Write-Host "::notice title=Full-history versioning::All historical dataset versions pass."
 
       - name: Upload full-history result
         if: always() && steps.target.outputs.skip == 'false'
