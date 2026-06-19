@@ -54,6 +54,14 @@
 
 name: Versioning (Full History)
 
+# Surface the validation target tag in the Actions run list. Evaluated at
+# workflow-queue time, so it draws from the trigger context rather than the
+# resolved tag from the Locate target release step. On release events the
+# tag arrives via github.event.release.tag_name; on dispatch via
+# inputs.release_tag (blank dispatches fall through to "latest" because the
+# real lookup happens in-step at runtime).
+run-name: "Versioning vs ${{ github.event.release.tag_name || inputs.release_tag || 'latest' }}"
+
 on:
   workflow_dispatch:
     inputs:
