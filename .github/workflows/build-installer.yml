@@ -641,9 +641,14 @@ jobs:
 
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
+          # softprops/action-gh-release's 'token' input has a default of
+          # ${{ github.token }}, which means env.GITHUB_TOKEN is never
+          # consulted when the action runs. The App token must be passed
+          # via the 'token' input to actually take effect. PR #48 set the
+          # env override instead and the App identity silently did not
+          # apply; validation on 2026-06-19 (run 27834810917) caught it.
+          token:       ${{ steps.app-token.outputs.token }}
           tag_name:    ${{ steps.tag.outputs.tag }}
           name:        ${{ steps.tag.outputs.name }}
           body_path:   release-body.md
