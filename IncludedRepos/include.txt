@@ -9,6 +9,7 @@ BHoM/LifeCycleAssessment_Toolkit
 BHoM/Lusas_Toolkit
 BHoM/MidasCivil_Toolkit
 BHoM/Mongo_Toolkit
+BHoM/OpenAI_Toolkit
 BHoM/OpenStreetMap_Toolkit
 BHoM/RAM_Toolkit
 BHoM/Revit_Toolkit
