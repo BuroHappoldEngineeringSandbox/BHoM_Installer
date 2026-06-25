@@ -277,6 +277,20 @@ $dlls | Set-Content $includedDllsTxt
 Write-Host "::notice::Staged $($dlls.Count) DLLs for the installer payload."
 Write-Host "IncludedDLLs.txt: $includedDllsTxt"
 
+# ─── Write IncludedDatasets.txt (mirrors BHoMBot's SaveIncludedDatasets.cs) ─
+
+$datasetsDir         = Join-Path $bhomProgramData 'Datasets'
+$includedDatasetsTxt = Join-Path $settingsDir 'IncludedDatasets.txt'
+
+$datasets = Get-ChildItem $datasetsDir -Recurse -Filter '*.json' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $_.FullName.Replace("$datasetsDir\", '').Replace('.json', '')
+            }
+
+$datasets | Set-Content $includedDatasetsTxt
+Write-Host "::notice::Recorded $($datasets.Count) datasets in IncludedDatasets.txt"
+Write-Host "IncludedDatasets.txt: $includedDatasetsTxt"
+
 # ─── Build the installer .sln itself ────────────────────────────────────────
 
 $installerSln = Join-Path $installerRoot "$InstallerRepoName.sln"
