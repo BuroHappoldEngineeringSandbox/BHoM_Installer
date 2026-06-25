@@ -235,22 +235,30 @@ function Build-ManifestFile {
 # sequentially because it is easier to debug and produces deterministic output.
 # Parallelism is a Phase 1.5 optimisation once the workflow is stable.
 
-Build-ManifestFile -FileName 'core.txt'
-Build-ManifestFile -FileName 'adapterCore.txt'
-Build-ManifestFile -FileName 'uiCore.txt'
-Build-ManifestFile -FileName 'dependencies.txt'
-Build-ManifestFile -FileName 'include.txt'
-Build-ManifestFile -FileName 'userInterfaces.txt'
+$manifests = @(
+    @{ File = 'core.txt' }
+    @{ File = 'adapterCore.txt' }
+    @{ File = 'uiCore.txt' }
+    @{ File = 'dependencies.txt' }
+    @{ File = 'include.txt' }
+    @{ File = 'userInterfaces.txt' }
 
-Build-ManifestFile -FileName 'altConfigs.txt' -WithConfig
+    @{ File = 'altConfigs.txt'; WithConfig = $true }
 
-# NOTE: BHoMBot calls UpdateFixedRevitVersioningTypes() here (Revit API mocks
-# for the Versioning_Toolkit build), followed by a 60-second sleep after the
-# versioning step. Both are skipped in this initial iteration. If either turns
-# out to be load-bearing, the Versioning_Toolkit build will fail or produce
-# incorrect output, at which point we add them back.
+    # NOTE: BHoMBot calls UpdateFixedRevitVersioningTypes() here (Revit API mocks
+    # for the Versioning_Toolkit build), followed by a 60-second sleep after the
+    # versioning step. Both are skipped in this initial iteration. If either turns
+    # out to be load-bearing, the Versioning_Toolkit build will fail or produce
+    # incorrect output, at which point we add them back.
 
-Build-ManifestFile -FileName 'versioning.txt'
+    @{ File = 'versioning.txt' }
+)
+
+foreach ($entry in $manifests) {
+    $splat = @{ FileName = $entry.File }
+    if ($entry.WithConfig) { $splat.WithConfig = $true }
+    Build-ManifestFile @splat
+}
 
 if ($ReleaseType -eq 'alpha') {
     Build-ManifestFile -FileName 'alphaIncludes.txt'
