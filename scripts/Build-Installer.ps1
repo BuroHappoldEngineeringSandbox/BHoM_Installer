@@ -231,9 +231,12 @@ function Build-ManifestFile {
 # Order matters: core first, then adapters, then UI, then deps, then includes,
 # and so on. Missing manifests are soft-skipped by Build-ManifestFile.
 #
-# BHoMBot parallelises some of these groups. For this initial iteration we run
-# sequentially because it is easier to debug and produces deterministic output.
-# Parallelism is a Phase 1.5 optimisation once the workflow is stable.
+# Sequential by design. BHoMBot parallelised some manifest groups to fit its
+# single-machine nightly window with multiple competing timers; ephemeral
+# cloud runners have no such constraint. Linear builds give traceable logs,
+# deterministic failure modes, and no race-on-DLL-output risk. Parallelism
+# remains available as an optimisation if wall-clock ever becomes a real
+# bottleneck, but is not currently warranted.
 
 $manifests = @(
     @{ File = 'core.txt' }
