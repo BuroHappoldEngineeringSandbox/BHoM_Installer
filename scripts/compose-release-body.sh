@@ -157,6 +157,14 @@ else
     fi
 fi
 
+# Conditionally append the Bundles line if this is a downstream installer bundling BHoM.
+if [ -n "${BUNDLED_INSTALLER_REF:-}" ]; then
+    cat >> release-body.md <<EOF
+
+**Bundles:** BHoM_Installer at \`${BUNDLED_INSTALLER_SHA:-unknown}\`, dependency_branch=\`${BUNDLED_INSTALLER_REF}\`
+EOF
+fi
+
 echo ""
 echo "=== Release body preview (first 80 lines) ==="
 head -80 release-body.md
@@ -319,6 +327,40 @@ EOF
     compose_main >/dev/null 2>&1
     body=$(cat release-body.md)
     assert_not_contains "Build leg is filtered out of test-results table" "| Build alpha installer |" "$body"
+
+    # ── BUNDLED_INSTALLER_REF block renders only when set ──
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha"
+    unset BUNDLED_INSTALLER_REF BUNDLED_INSTALLER_SHA
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_not_contains "BUNDLED_INSTALLER_REF unset does NOT render Bundles block" "Bundles:" "$body"
+
+    # ── BUNDLED_INSTALLER_REF block renders when set ──
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha"
+    export BUNDLED_INSTALLER_REF="develop"
+    export BUNDLED_INSTALLER_SHA="abc1234deadbeef"
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_contains "BUNDLED_INSTALLER_REF set renders Bundles block" "**Bundles:** BHoM_Installer at" "$body"
+    assert_contains "Bundles block includes SHA" "abc1234deadbeef" "$body"
+    assert_contains "Bundles block includes dependency_branch" "dependency_branch=\`develop\`" "$body"
+
+    # ── BUNDLED_INSTALLER_REF block falls back to 'unknown' SHA when unset ──
+    setup_env
+    export INSTALLER_REF="develop"
+    export RELEASE_TYPE="alpha"
+    export BUNDLED_INSTALLER_REF="develop"
+    unset BUNDLED_INSTALLER_SHA
+    rm -f release-body.md
+    compose_main >/dev/null 2>&1
+    body=$(cat release-body.md)
+    assert_contains "BUNDLED_INSTALLER_SHA unset renders 'unknown'" "unknown" "$body"
 
     cd - >/dev/null
     rm -rf "$tmpdir"
