@@ -344,7 +344,7 @@ if (-not (Test-Path $buildDir)) {
     }
 }
 
-$msi = Get-ChildItem $buildDir -Filter '*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+$msi = Get-ChildItem $buildDir -Filter '*.msi' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $msi) { throw "No .msi produced in $buildDir" }
 
 $sizeMB = [math]::Round($msi.Length / 1MB, 2)
