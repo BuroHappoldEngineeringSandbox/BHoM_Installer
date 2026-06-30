@@ -245,6 +245,7 @@ $manifests = @(
     @{ File = 'dependencies.txt' }
     @{ File = 'include.txt' }
     @{ File = 'userInterfaces.txt' }
+    @{ File = 'analytics.txt' }
 
     @{ File = 'altConfigs.txt'; WithConfig = $true }
 
