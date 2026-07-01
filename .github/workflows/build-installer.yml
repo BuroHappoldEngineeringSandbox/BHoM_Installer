@@ -51,17 +51,17 @@ on:
       dependency_branch:
         description: |
           Branch to try first on every dep repo clone. Falls back to each
-          dep's own default branch when the requested branch is not present
-          (most BHoM deps have develop as default).
-          Default 'develop' for all release types.
+          dep's own default branch when the requested branch is not present.
+          Leave empty to skip the try-first step and clone every dep at its
+          own default branch (develop for every current beta-tier repo).
           Useful for testing a feature branch across deps that share the
           branch name (alpha workflow).
-          For alpha-beta and beta dispatches: convention is develop; a non-conventional
-          value surfaces a warning in the run log and release body but is not
-          rejected.
+          For alpha-beta and beta dispatches: convention is empty or 'develop';
+          any other value surfaces a warning in the run log and release body
+          but is not rejected.
         type: string
         required: false
-        default: 'develop'
+        default: ''
 
   schedule:
     - cron: '45 0 * * *'   # 00:45 UTC nightly, matching BHoMBot
