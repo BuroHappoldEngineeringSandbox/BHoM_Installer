@@ -325,20 +325,39 @@ jobs:
               throw ".msi size $mb MB is outside the 30-100 MB sanity range, indicating a possible packaging regression"
           }
 
+      # actions/upload-artifact@v4 preserves paths relative to the common
+      # ancestor of all inputs. Staging IncludedDLLs.txt into Build/ (rather
+      # than uploading directly from Settings/) keeps the common ancestor at
+      # Build/ so the artefact stays flat — install-test uses
+      # `Get-Item msi\*.msi` at the artefact root and would fail 1619 on a
+      # nested layout.
+      - name: Stage IncludedDLLs.txt into Build/ for artefact upload
+        if: success()
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:GITHUB_WORKSPACE 'Settings/IncludedDLLs.txt'
+          $dst = Join-Path $env:GITHUB_WORKSPACE 'Build/IncludedDLLs.txt'
+          if (-not (Test-Path $src)) {
+              throw "Expected $src to exist after Build-Installer.ps1 ran, but it does not."
+          }
+          Copy-Item $src $dst -Force
+          Write-Host "Staged IncludedDLLs.txt at $dst for artefact upload."
+
       - name: Upload installer artefact
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: installer-${{ needs.resolve.outputs.release_type }}-${{ github.run_id }}
           # Settings/IncludedDLLs.txt is written by Build-Installer.ps1
-          # alongside the .msi build. Attaching it as a standalone artefact +
-          # Release asset gives downstream workflows (notably ci-versioning.yml)
-          # a baseline of the last-shipped canonical DLL set without needing
-          # to extract the .msi.
+          # alongside the .msi build; staged into Build/ by the preceding step
+          # so the artefact common ancestor remains Build/. Attaching it as
+          # a standalone Release asset gives downstream workflows (notably
+          # ci-versioning.yml) a baseline of the last-shipped canonical DLL
+          # set without needing to extract the .msi.
           path: |
             ${{ github.workspace }}/Build/*.msi
             ${{ github.workspace }}/Build/dep-manifest.json
-            ${{ github.workspace }}/Settings/IncludedDLLs.txt
+            ${{ github.workspace }}/Build/IncludedDLLs.txt
           if-no-files-found: error
           retention-days: 30
 
