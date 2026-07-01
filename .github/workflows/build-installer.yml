@@ -330,9 +330,15 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: installer-${{ needs.resolve.outputs.release_type }}-${{ github.run_id }}
+          # Settings/IncludedDLLs.txt is written by Build-Installer.ps1
+          # alongside the .msi build. Attaching it as a standalone artefact +
+          # Release asset gives downstream workflows (notably ci-versioning.yml)
+          # a baseline of the last-shipped canonical DLL set without needing
+          # to extract the .msi.
           path: |
             ${{ github.workspace }}/Build/*.msi
             ${{ github.workspace }}/Build/dep-manifest.json
+            ${{ github.workspace }}/Settings/IncludedDLLs.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -655,6 +661,7 @@ jobs:
           files: |
             artefact/*.msi
             artefact/dep-manifest.json
+            artefact/IncludedDLLs.txt
           make_latest: ${{ needs.resolve.outputs.make_latest }}
           prerelease:  ${{ needs.resolve.outputs.prerelease }}
 
