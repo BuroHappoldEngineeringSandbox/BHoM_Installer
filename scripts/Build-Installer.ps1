@@ -38,8 +38,9 @@
     Branch to try first on each dependency repo clone. Falls back to each
     dep's actual default branch (the GitHub default, whatever that is)
     when the requested branch is not present.
-    Defaults to 'develop'. Pass an empty string to skip the try-first step
-    entirely and clone each dep at its own default branch.
+    Defaults to empty, which skips the try-first step entirely and clones
+    each dep at its own default branch. Pass an explicit branch name (e.g.
+    'feature/foo') to try that branch first before falling back.
 #>
 
 [CmdletBinding()]
@@ -54,7 +55,7 @@ param(
 
     [string]$InstallerRepoName = 'BHoM_Installer',
 
-    [string]$DependencyBranch = 'develop'
+    [string]$DependencyBranch = ''
 )
 
 $ErrorActionPreference = 'Stop'

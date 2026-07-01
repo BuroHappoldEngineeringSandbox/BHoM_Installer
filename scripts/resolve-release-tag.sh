@@ -229,7 +229,7 @@ resolve_main() {
     case "$event" in
         schedule)
             release_type=alpha
-            dependency_branch=develop
+            dependency_branch=""
             prerelease=true
             make_latest=false
             release_tag=""
@@ -248,11 +248,12 @@ resolve_main() {
 
         workflow_dispatch)
             release_type="${in_type:-alpha}"
-            # dependency_branch defaults to 'develop' when input is empty.
-            # The value flows through to Build-Installer.ps1 as the try-first
-            # branch on each dep clone; missing branches fall back to each
-            # dep's actual default branch.
-            dependency_branch="${in_dep_branch:-develop}"
+            # dependency_branch flows through to Build-Installer.ps1 as the
+            # try-first branch on each dep clone. Empty is the default and
+            # skips the try-first step, cloning each dep at its own default
+            # branch. Explicit values (e.g. 'develop', 'feature/foo') are
+            # tried first with fallback to the dep's default.
+            dependency_branch="${in_dep_branch:-}"
 
             case "$release_type" in
                 alpha)
@@ -534,7 +535,7 @@ EOF
                      lookup_releases(){ :; }; \
                      resolve_main 2>/dev/null)
     assert_equal "schedule -> release_type=alpha"        "alpha"   "$(echo "$out" | grep '^release_type='      | cut -d= -f2)"
-    assert_equal "schedule -> dependency_branch=develop" "develop" "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
+    assert_equal "schedule -> dependency_branch empty"   ""        "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
     assert_equal "schedule -> prerelease=true"           "true"    "$(echo "$out" | grep '^prerelease='        | cut -d= -f2)"
     assert_equal "schedule -> make_latest=false"         "false"   "$(echo "$out" | grep '^make_latest='       | cut -d= -f2)"
     assert_equal "schedule -> release_tag empty"         ""        "$(echo "$out" | grep '^release_tag='       | cut -d= -f2)"
@@ -572,12 +573,13 @@ EOF
     assert_equal "dispatch beta -> tag=v9.2.0-beta"              "v9.2.0-beta"  "$(echo "$out" | grep '^release_tag='       | cut -d= -f2)"
     assert_equal "dispatch beta -> msi_patch=0"                  "0"            "$(echo "$out" | grep '^msi_patch_version=' | cut -d= -f2)"
 
-    # workflow_dispatch beta with empty INPUT_DEPENDENCY_BRANCH defaults to develop.
+    # workflow_dispatch beta with empty INPUT_DEPENDENCY_BRANCH passes empty
+    # through so Build-Installer.ps1 falls back to each dep's default branch.
     export GITHUB_REF=refs/heads/develop INPUT_DEPENDENCY_BRANCH="" INPUT_DEFAULT_BRANCH=develop
     out=$(lookup_tags()    { :; }; \
           lookup_releases(){ :; }; \
           resolve_main 2>/dev/null)
-    assert_equal "dispatch beta + empty dep_branch -> dependency_branch=develop" "develop" \
+    assert_equal "dispatch beta + empty dep_branch -> dependency_branch empty" "" \
         "$(echo "$out" | grep '^dependency_branch=' | cut -d= -f2)"
 
     # workflow_dispatch alpha-beta msi_patch equals the counter.
