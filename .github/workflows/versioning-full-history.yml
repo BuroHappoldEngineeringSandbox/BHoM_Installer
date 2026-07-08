@@ -388,7 +388,7 @@ jobs:
       - name: Prepare VersioningRunner
         id: fh-runner
         if: steps.target.outputs.skip == 'false'
-        uses: BuroHappoldEngineeringAdmin/CI_Toolkit/.github/actions/prepare-runner@main
+        uses: BuroHappoldEngineeringAdmin/CI_Toolkit/.github/actions/prepare-runner@develop
         with:
           runner_project: tools/VersioningRunner/src/VersioningRunner/VersioningRunner.csproj
           output_dir: out\versioning-runner
