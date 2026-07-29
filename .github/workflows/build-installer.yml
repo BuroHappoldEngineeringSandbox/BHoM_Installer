@@ -273,25 +273,44 @@ jobs:
         # downloads the previous release's copy of this file and diffs it
         # against this one to render "what changed since last build" notes.
         #
-        # The recorded `branch` field is what was REQUESTED (the dependency_branch
-        # input). Each dep's actual cloned branch may differ if it fell back to
-        # the dep's default — that information lives in the dep repo itself.
+        # The per-dep `branch` field records the branch each dep was actually
+        # RESOLVED to, read back from the clone. The requested branch is kept at
+        # the manifest's top level as `dependency_branch`.
         env:
           RELEASE_TYPE:      ${{ needs.resolve.outputs.release_type }}
           DEPENDENCY_BRANCH: ${{ needs.resolve.outputs.dependency_branch }}
           INSTALLER_REF:     ${{ needs.resolve.outputs.installer_ref }}
         run: |
+          # Build-Installer.ps1 clones every dep into its $CodeLocation, which is
+          # the parent of this repo's checkout. Derive both the walk root and the
+          # installer's own folder name from GITHUB_WORKSPACE rather than hardcoding
+          # the hosted-runner path: a self-hosted runner, a runner-image drive
+          # change, or a repo rename would otherwise leave the walk pointing at a
+          # nonexistent directory and, because Get-ChildItem is non-fatal here,
+          # silently emit `deps: {}` on an otherwise-green build.
+          $codeLocation  = Split-Path -Parent $env:GITHUB_WORKSPACE
+          $installerName = Split-Path -Leaf   $env:GITHUB_WORKSPACE
+
           $depsObject = [ordered]@{}
-          Get-ChildItem 'D:\a\BHoM_Installer' -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -ne 'BHoM_Installer' -and (Test-Path (Join-Path $_.FullName '.git')) } |
+          Get-ChildItem $codeLocation -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -ne $installerName -and (Test-Path (Join-Path $_.FullName '.git')) } |
               Sort-Object Name |
               ForEach-Object {
                   $remoteUrl = (git -C $_.FullName config --get remote.origin.url 2>$null)
                   if ($remoteUrl -match 'github\.com[/:]([^/]+)/([^/.]+?)(?:\.git)?$') {
                       $orgRepo = "$($Matches[1])/$($Matches[2])"
                       $sha = (git -C $_.FullName rev-parse HEAD 2>$null).Trim()
+                      # Record the RESOLVED branch, not the requested one. Clone-Repo
+                      # skips --branch entirely when DependencyBranch is empty, so the
+                      # requested value is blank on every default-path build and the
+                      # branch each dep actually landed on is only knowable from the
+                      # clone. Tag refs would leave a detached HEAD; the SHA above
+                      # already identifies those, so label them rather than lie.
+                      $resolvedBranch = (git -C $_.FullName rev-parse --abbrev-ref HEAD 2>$null)
+                      if ($resolvedBranch) { $resolvedBranch = $resolvedBranch.Trim() }
+                      if (-not $resolvedBranch -or $resolvedBranch -eq 'HEAD') { $resolvedBranch = '(detached)' }
                       if ($sha) {
-                          $depsObject[$orgRepo] = [ordered]@{ branch = $env:DEPENDENCY_BRANCH; sha = $sha }
+                          $depsObject[$orgRepo] = [ordered]@{ branch = $resolvedBranch; sha = $sha }
                       }
                   }
               }
