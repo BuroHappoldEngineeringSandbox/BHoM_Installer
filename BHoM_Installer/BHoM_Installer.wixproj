@@ -4,7 +4,7 @@
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">x86</Platform>
     <MajorVersion Condition=" '$(MajorVersion)' == '' ">9</MajorVersion>
-    <MinorVersion Condition=" '$(MinorVersion)' == '' ">2</MinorVersion>
+    <MinorVersion Condition=" '$(MinorVersion)' == '' ">3</MinorVersion>
     <VersionSuffix>
     </VersionSuffix>
     <ProductVersion>$(MajorVersion).$(MinorVersion)</ProductVersion>
