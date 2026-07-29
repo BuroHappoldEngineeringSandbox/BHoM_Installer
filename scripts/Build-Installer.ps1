@@ -248,6 +248,28 @@ $manifests = @(
     @{ File = 'userInterfaces.txt' }
     @{ File = 'analytics.txt' }
 
+    # NOTE: BHoMBot processes revitTools_Beta.txt here (CloneInstaller.cs:20),
+    # ahead of altConfigs. Its absence is deliberate; re-adding it would add
+    # redundant builds, not payload.
+    #
+    # Under BHoMBot the manifest's real job was CLONING. BuildConfigs()
+    # (CloneInstaller.cs:132-156) only builds <repo>\<repo>.sln at a named
+    # config and never clones, so the 12 BHE Revit_*_Tool repos had to be on
+    # disk already - revitTools_Beta.txt is what put them there.
+    #
+    # Build-ManifestFile -WithConfig clones AND builds, so the altConfigs pass
+    # below already brings all 12 down: every one of them appears in
+    # BuroHappold_Installer's altConfigs.txt with Release2022-Release2026.
+    # The extra plain-config build is redundant - each repo sets
+    # AssemblyName = <Name>_$(RevitVersion), and the plain 'Debug'/'Release'
+    # PropertyGroup sets RevitVersion=2022 / net48 / REVIT2022, identical to
+    # Release2022, so it re-emits a file Release2022 already produces.
+    #
+    # Payload equivalence is reasoned from build configuration, not yet from an
+    # artefact diff (no BHE MSI parity run has been done). See
+    # docs/audits/2026-07-28-installer-production-fidelity-comparison.md rows
+    # 6 and 20.
+
     @{ File = 'altConfigs.txt'; WithConfig = $true }
 
     # NOTE: BHoMBot calls UpdateFixedRevitVersioningTypes() here (Revit API mocks
