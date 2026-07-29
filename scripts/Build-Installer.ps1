@@ -294,6 +294,18 @@ if ($ReleaseType -eq 'alpha') {
 
 # ─── Write IncludedDLLs.txt (mirrors BHoMBot's SaveIncludedDLLs.cs) ─────────
 
+# This file and IncludedDatasets.txt below are both generated here.
+# InstallerCore/Components.wxs:88-89 sources both as WiX <File> inputs.
+#
+# KNOWN GAP, deliberately left for now: a stale Settings/IncludedDLLs.txt is
+# still committed (blob d1276e3, last touched 2021-08-10 - absolute paths from
+# a retired machine). It is overwritten here before the workflow stages it, so
+# the committed copy is never what ships. It also protects nothing, because
+# IncludedDatasets.txt has been uncommitted since PR #54 replaced it with a
+# generator, so a bare local build of the .sln already fails on the missing
+# datasets file. Removing it is a separate cleanup; documented so the
+# committed copy is not mistaken for the shipped content.
+
 $assembliesDir   = Join-Path $bhomProgramData 'Assemblies'
 $dlls            = Get-ChildItem $assembliesDir -Filter '*.dll' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 $settingsDir     = Join-Path $installerRoot 'Settings'
