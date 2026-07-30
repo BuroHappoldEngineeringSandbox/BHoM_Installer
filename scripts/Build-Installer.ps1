@@ -318,6 +318,10 @@ $revitMockDlls = @(
     'UIFramework.dll'
     'UIFrameworkServices.dll'
 )
+# REVISIT THIS GATE if a [PreviousVersion] attribute is ever added to a
+# RevitAPI-referencing assembly on the BHoM/OSS side: it would be dropped from
+# vNN.json silently, exactly as the BHE one was. See row 7 / P.6.1 in
+# docs/audits/2026-07-28-installer-production-fidelity-comparison.md.
 $useRevitMocks = $InstallerRepoName -eq 'BuroHappold_Installer'
 $stubDir       = Join-Path $bhomProgramData 'Assemblies'
 
