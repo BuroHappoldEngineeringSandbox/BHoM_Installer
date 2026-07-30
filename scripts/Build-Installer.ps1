@@ -272,19 +272,85 @@ $manifests = @(
 
     @{ File = 'altConfigs.txt'; WithConfig = $true }
 
-    # NOTE: BHoMBot calls UpdateFixedRevitVersioningTypes() here (Revit API mocks
-    # for the Versioning_Toolkit build), followed by a 60-second sleep after the
-    # versioning step. Both are skipped in this initial iteration. If either turns
-    # out to be load-bearing, the Versioning_Toolkit build will fail or produce
-    # incorrect output, at which point we add them back.
-
-    @{ File = 'versioning.txt' }
+    # versioning.txt is deliberately NOT in this list. It runs below, bracketed
+    # by the Revit API mock install and removal, matching BHoMBot's ordering in
+    # CloneInstaller.cs.
 )
 
 foreach ($entry in $manifests) {
     $splat = @{ FileName = $entry.File }
     if ($entry.WithConfig) { $splat.WithConfig = $true }
     Build-ManifestFile @splat
+}
+
+# ─── versioning.txt, bracketed by the Revit API mocks ───────────────────────
+
+# PostBuild.exe (Versioning_Toolkit) builds vNN.json from two sources: committed
+# Versioning_NN.json files, and reflection over the assemblies folder for
+# [PreviousVersion] attributes. For the reflection pass to see a Revit tool
+# assembly it must be able to load it, which needs RevitAPI.dll and RevitAPIUI.dll
+# present in C:\ProgramData\BHoM\Assemblies. PostBuild's Program.cs LoadFroms
+# both inside a bare `catch {}`, so when they are absent nothing fails and
+# nothing warns - the attributes are simply never read and the upgrade entries
+# are silently missing from the shipped vNN.json.
+#
+# That is not hypothetical: the 2026-07-30 alpha MSI parity diff found our
+# v93.json missing the MEPExtractor rename from Revit_MechanicalPlumbing_Tool,
+# whose signature takes Autodesk.Revit.DB types, while the one entry we did emit
+# came from Revit_Engine, which carries no RevitAPI reference. See
+# docs/audits/2026-07-28-installer-production-fidelity-comparison.md row 7.
+#
+# BHoMBot does the same bracketing (UpdateFixedRevitVersioningTypes then
+# DeleteRevitVersioningTypes, CloneInstaller.cs:26 and :33), and its comment
+# gives the same reason. The mocks are reference stubs only and must not ship,
+# so they are removed before the installer solution is built.
+#
+# BuroHappoldEngineering/RevitAPIMock is private, and only the BHE workflow mints
+# an App token able to read it, so this is gated on the installer being built.
+# The BHoM installer's Revit payload comes from Revit_Toolkit, whose
+# [PreviousVersion] attributes live in the RevitAPI-free Revit_Engine, so it has
+# nothing to gain here today. If a BHoM-side attribute ever lands in a
+# RevitAPI-referencing assembly this gate is what will need revisiting.
+$revitMockDlls = @(
+    'AdWindows.dll'
+    'RevitAPI.dll'
+    'RevitAPIUI.dll'
+    'UIFramework.dll'
+    'UIFrameworkServices.dll'
+)
+$useRevitMocks = $InstallerRepoName -eq 'BuroHappold_Installer'
+$stubDir       = Join-Path $bhomProgramData 'Assemblies'
+
+if ($useRevitMocks) {
+    Write-Host "::group::RevitAPIMock (reference stubs for the versioning attribute scrape)"
+    $mockRoot = Clone-Repo -OrgRepo 'BuroHappoldEngineering/RevitAPIMock'
+    Build-Solution -SlnPath (Join-Path $mockRoot 'RevitAPIMock.sln')
+
+    # The mock projects xcopy themselves into the assemblies folder on PostBuild.
+    # If that did not happen the scrape would silently degrade again, so check.
+    $missing = @($revitMockDlls | Where-Object { -not (Test-Path (Join-Path $stubDir $_)) })
+    if ($missing.Count -gt 0) {
+        throw "RevitAPIMock built but these stubs are not in $stubDir : $($missing -join ', ')"
+    }
+    Write-Host "Revit API stubs staged: $($revitMockDlls -join ', ')"
+    Write-Host "::endgroup::"
+}
+else {
+    Write-Host "::notice::Skipping RevitAPIMock for $InstallerRepoName (private to BHE; see row 7 note above)."
+}
+
+Build-ManifestFile -FileName 'versioning.txt'
+
+if ($useRevitMocks) {
+    # Mirrors DeleteRevitVersioningTypes(). These are API stubs, not payload:
+    # leaving them staged would ship a fake RevitAPI.dll inside the installer.
+    foreach ($dll in $revitMockDlls) {
+        $stub = Join-Path $stubDir $dll
+        if (Test-Path $stub) { Remove-Item $stub -Force }
+    }
+    $left = @($revitMockDlls | Where-Object { Test-Path (Join-Path $stubDir $_) })
+    if ($left.Count -gt 0) { throw "Failed to remove Revit API stubs before the installer build: $($left -join ', ')" }
+    Write-Host "::notice::Removed the Revit API stubs; they are not installer payload."
 }
 
 if ($ReleaseType -eq 'alpha') {
