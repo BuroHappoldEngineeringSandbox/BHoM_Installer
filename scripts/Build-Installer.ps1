@@ -321,10 +321,28 @@ Write-Host "IncludedDLLs.txt: $includedDllsTxt"
 $datasetsDir         = Join-Path $bhomProgramData 'Datasets'
 $includedDatasetsTxt = Join-Path $settingsDir 'IncludedDatasets.txt'
 
+# Entries must be RELATIVE to the datasets root. Library_Engine's IsPrototype
+# compares this file's lines against relative dataset names, so a rooted entry
+# makes every core dataset read as a prototype.
+#
+# Resolve the root off the filesystem before trimming it, rather than trimming
+# the constructed $datasetsDir string. Get-ChildItem's FullName does not always
+# echo back the casing or path form it was given, and String.Replace both is
+# case-sensitive and returns the input unchanged on a miss, so a constructed
+# prefix can silently fail to strip and ship absolute paths.
+$datasetsRoot = (Get-Item $datasetsDir).FullName.TrimEnd('\')
+
 $datasets = Get-ChildItem $datasetsDir -Recurse -Filter '*.json' -ErrorAction SilentlyContinue |
             ForEach-Object {
-                $_.FullName.Replace("$datasetsDir\", '').Replace('.json', '')
+                $_.FullName.Substring($datasetsRoot.Length).TrimStart('\').Replace('.json', '')
             }
+
+# The strip above must not be allowed to fail quietly again.
+$rooted = @($datasets | Where-Object { [System.IO.Path]::IsPathRooted($_) })
+if ($rooted.Count -gt 0) {
+    throw ("IncludedDatasets.txt would ship {0} rooted path(s), e.g. '{1}'. Expected paths relative to {2}." -f `
+           $rooted.Count, $rooted[0], $datasetsRoot)
+}
 
 $datasets | Set-Content $includedDatasetsTxt
 Write-Host "::notice::Recorded $($datasets.Count) datasets in IncludedDatasets.txt"
