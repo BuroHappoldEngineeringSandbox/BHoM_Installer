@@ -23,6 +23,14 @@
 
 name: Build Installer
 
+# Run title is the release tier, verbatim from the release_type vocabulary used by
+# the tag scheme and the wixproj Configuration mapping. The Actions UI already shows
+# the trigger and timing, so a "(nightly)" marker would be redundant, and the friendly
+# forms ("Alpha", "Release Candidate", "Release") are composed by the publish job for
+# the Releases page. Scheduled runs have no inputs, so the fallback matches the input
+# default rather than encoding a trigger.
+run-name: ${{ inputs.release_type || 'alpha' }}
+
 on:
   workflow_dispatch:
     inputs:
