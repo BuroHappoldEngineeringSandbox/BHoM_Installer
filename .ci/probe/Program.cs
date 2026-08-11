@@ -1,12 +1,15 @@
 // VALIDATION BRANCH ONLY. Diagnostic for CI_Toolkit #151.
 //
-// Question: is a deletion declared in a version INSIDE the upgrade walk honoured on a
-// clean MSI install? The framework's mechanism is Upgrade.cs:472 throw NoUpdateException
-// -> ToNewVersion.cs:107 RecordError("No upgrade for ...") -> FromJson.cs:223 detected
-// -> PassResult. UpgradersToCall walks the document's version up to BHoMVersion(), so a
-// declaration newer than the installed version is unreachable. The eight full-history
-// candidates are declared in v71 and v81, which ARE inside the walk for older datasets,
-// so the version bound does not explain them.
+// Round 2. Round 1 showed a v71-declared method failing because the document's version
+// was unparseable ("Version provided doesn't fit the format <Major>.<Minor>", upgrades
+// reported "from version ?.?"), so the v7.1 converter was never applied and the
+// MessageForDeleted entry was never consulted. But that payload came from dataset 2.4,
+// which #158 says --test-all omits, so it is not one of the eight candidates.
+//
+// This round tests the SAME declared method across EVERY dataset version it appears in,
+// and reports per version: the parsed version, whether the version was parseable, whether
+// the "No upgrade for" event fired, and the result. That separates "only the omitted
+// early datasets are broken" from "all of them are".
 
 using System.Reflection;
 using System.Runtime.Loader;
@@ -22,7 +25,6 @@ AssemblyLoadContext.Default.Resolving += static (ctx, n) =>
 var asms = new List<Assembly>();
 foreach (var f in Directory.GetFiles(@"C:\ProgramData\BHoM\Assemblies", "*.dll"))
 { try { asms.Add(Assembly.LoadFrom(f)); } catch { } }
-Console.WriteLine($"loaded assemblies: {asms.Count}");
 
 Type FT(string s) { foreach (var a in asms) { try { var t = a.GetType(s, false); if (t is not null) return t; } catch { } } return null; }
 MethodInfo FM(Type t, string n, int c) => t?.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
@@ -33,65 +35,69 @@ var bc = FT("BH.Engine.Base.Compute");
 var vq = FT("BH.Engine.Versioning.Query");
 var vm = FT("BH.Engine.Versioning.Modify");
 var bd = FT("MongoDB.Bson.BsonDocument");
-Console.WriteLine($"types: BaseQuery={bq is not null} BaseCompute={bc is not null} VerQuery={vq is not null} VerModify={vm is not null} Bson={bd is not null}");
+var fromJson = FM(FT("BH.Engine.Serialiser.Convert"), "FromJson", 1);
+var clear = FM(bc, "ClearCurrentEvents", 0);
+var cur = FM(bq, "CurrentEvents", 0);
+var parse = bd.GetMethod("Parse", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+var getKey = FM(vm, "GetMethodKey", 1);
+var docVersion = FM(vq, "Version", 1);   // BsonDocument.Version()
 
-Console.WriteLine("installed BHoMVersion(): " + FM(bq, "BHoMVersion", 0)?.Invoke(null, null));
+Console.WriteLine($"installed BHoMVersion(): {FM(bq, "BHoMVersion", 0)?.Invoke(null, null)}");
+Console.WriteLine($"Query.Version(doc) available: {docVersion is not null}");
 
-var upg = FM(vq, "UpgradersToCall", 1);
-foreach (var v in new[] { "6.0", "7.0", "7.1", "8.0", "9.2" })
-{
-    var l = upg?.Invoke(null, new object[] { v }) as System.Collections.IEnumerable;
-    Console.WriteLine($"  UpgradersToCall(\"{v}\") -> [{string.Join(", ", (l ?? Array.Empty<object>()).Cast<object>())}]");
-}
-
-// A method declared under MessageForDeleted in v71.
 const string Target = "IsLongitudinal";
 string root = @"C:\ProgramData\BHoM\Datasets\TestSets\Versioning";
-Console.WriteLine($"\ndataset root exists: {Directory.Exists(root)}");
-string payload = null, fromVer = null;
-if (Directory.Exists(root))
+
+// Every dataset version containing the target, with one payload each.
+var found = new List<(string Ver, string Payload)>();
+foreach (var dir in Directory.GetDirectories(root).OrderBy(x => x, StringComparer.Ordinal))
 {
-    foreach (var dir in Directory.GetDirectories(root).OrderBy(x => x))
+    foreach (var file in Directory.GetFiles(dir, "*.json"))
     {
-        foreach (var file in Directory.GetFiles(dir, "*.json"))
-        {
-            foreach (var line in File.ReadLines(file))
-                if (line.Contains(Target)) { payload = line.Trim().TrimEnd(','); fromVer = Path.GetFileName(dir); break; }
-            if (payload is not null) break;
-        }
-        if (payload is not null) break;
+        string hit = File.ReadLines(file).FirstOrDefault(l => l.Contains(Target));
+        if (hit is not null) { found.Add((Path.GetFileName(dir), hit.Trim().TrimEnd(','))); break; }
     }
 }
-Console.WriteLine($"payload for '{Target}': {(payload is null ? "NOT FOUND" : $"dataset {fromVer}, {payload.Length} chars")}");
-if (payload is null) return;
+Console.WriteLine($"\ndataset versions containing '{Target}': {found.Count} -> {string.Join(", ", found.Select(f => f.Ver))}");
+Console.WriteLine("(#158 records --test-all as omitting 2.4, 3.0, 3.1)\n");
 
-object doc = bd.GetMethod("Parse", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null)
-                .Invoke(null, new object[] { payload });
-string key = (string)FM(vm, "GetMethodKey", 1).Invoke(null, new[] { doc });
-Console.WriteLine("built key: " + key);
+Console.WriteLine($"{"dataset",-9} {"doc.Version()",-14} {"parseable",-10} {"keyInV71",-9} {"detected",-9} {"result",-8} events");
+Console.WriteLine(new string('-', 82));
 
-var conv = vq.GetMethods(BindingFlags.Public | BindingFlags.Static).FirstOrDefault(m => m.Name == "Converter" && m.GetParameters().Length == 1);
-foreach (var v in new[] { "7.1", "8.1", "9.2" })
+foreach (var (ver, payload) in found)
 {
-    object c = conv.Invoke(null, new object[] { v });
-    var mfd = c?.GetType().GetProperty("MessageForDeleted")?.GetValue(c) as System.Collections.IDictionary;
-    var mnu = c?.GetType().GetProperty("MessageForNoUpgrade")?.GetValue(c) as System.Collections.IDictionary;
-    Console.WriteLine($"  v{v}: converter={(c is null ? "NULL" : "ok")} deleted={mfd?.Count ?? -1} containsBuiltKey={mfd?.Contains(key)} noUpgradeContains={mnu?.Contains(key)}");
+    object doc = null; string parsedVer = "?";
+    try { doc = parse.Invoke(null, new object[] { payload }); } catch { }
+    if (doc is not null && docVersion is not null)
+    { try { parsedVer = docVersion.Invoke(null, new[] { doc })?.ToString() ?? "null"; } catch (Exception e) { parsedVer = "throw:" + (e.InnerException ?? e).GetType().Name; } }
+
+    string key = "";
+    try { key = (string)getKey.Invoke(null, new[] { doc }); } catch { }
+
+    bool inV71 = false;
+    var conv = vq.GetMethods(BindingFlags.Public | BindingFlags.Static).FirstOrDefault(m => m.Name == "Converter" && m.GetParameters().Length == 1);
+    try
+    {
+        object c = conv.Invoke(null, new object[] { "7.1" });
+        var mfd = c?.GetType().GetProperty("MessageForDeleted")?.GetValue(c) as System.Collections.IDictionary;
+        inV71 = mfd is not null && key is not null && mfd.Contains(key);
+    }
+    catch { }
+
+    clear?.Invoke(null, null);
+    object res = null;
+    try { res = fromJson.Invoke(null, new object[] { payload }); } catch { }
+
+    bool detected = false, badVersion = false; int n = 0;
+    foreach (var e in (cur?.Invoke(null, null) as System.Collections.IEnumerable) ?? Array.Empty<object>())
+    {
+        n++;
+        var m = e.GetType().GetProperty("Message")?.GetValue(e)?.ToString() ?? "";
+        if (m.StartsWith("No upgrade for", StringComparison.Ordinal)) detected = true;
+        if (m.Contains("doesn't fit the format")) badVersion = true;
+    }
+
+    Console.WriteLine($"{ver,-9} {parsedVer,-14} {(badVersion ? "NO" : "yes"),-10} {inV71,-9} {detected,-9} {(res is null ? "NULL" : "ok"),-8} {n}");
 }
 
-FM(bc, "ClearCurrentEvents", 0)?.Invoke(null, null);
-object res = null; string err = null;
-try { res = FM(FT("BH.Engine.Serialiser.Convert"), "FromJson", 1).Invoke(null, new object[] { payload }); }
-catch (Exception e) { err = (e.InnerException ?? e).Message; }
-Console.WriteLine($"\nFromJson result: {(res is null ? "NULL" : res.GetType().Name)}{(err is null ? "" : "  threw: " + err)}");
-
-bool detected = false; int i = 0;
-foreach (var e in (FM(bq, "CurrentEvents", 0)?.Invoke(null, null) as System.Collections.IEnumerable) ?? Array.Empty<object>())
-{
-    i++;
-    var m = e.GetType().GetProperty("Message")?.GetValue(e)?.ToString() ?? "";
-    if (m.StartsWith("No upgrade for", StringComparison.Ordinal)) detected = true;
-    Console.WriteLine($"  event[{i}]: {m.Replace("\n", " | ").Substring(0, Math.Min(150, m.Length))}");
-}
-Console.WriteLine($"events: {i}");
-Console.WriteLine($"detected (\"No upgrade for\") = {detected}   <-- true means FromJson.cs:226 PASSES the item");
+Console.WriteLine("\ndetected=True means FromJson.cs:226 passes the item (declared deletion honoured).");
