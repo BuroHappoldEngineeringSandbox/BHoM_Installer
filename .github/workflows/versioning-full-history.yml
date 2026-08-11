@@ -397,9 +397,27 @@ jobs:
           source_dir: tools/VersioningRunner/src
           dotnet_version: '8.0'
 
+      # VALIDATION BRANCH ONLY - DO NOT MERGE. Diagnostic for CI_Toolkit #151.
+      # This workflow has no checkout of its own (it downloads an .msi and clones the
+      # toolkits explicitly), so the probe sources have to be fetched deliberately.
+      - name: Checkout probe sources
+        if: steps.target.outputs.skip == 'false'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          sparse-checkout: .ci/probe
+          path: probe-src
+
+      - name: Probe declared-deletion handling
+        if: steps.target.outputs.skip == 'false'
+        continue-on-error: true
+        run: |
+          Push-Location "$env:GITHUB_WORKSPACE\probe-src\.ci\probe"
+          dotnet run -c Release 2>&1 | ForEach-Object { Write-Host $_ }
+          Pop-Location
+
       - name: Run versioning (full-history)
         id: fh-run
-        if: steps.target.outputs.skip == 'false'
+        if: false   # VALIDATION BRANCH ONLY: the probe above is the experiment
         run: |
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\Build" | Out-Null
 
