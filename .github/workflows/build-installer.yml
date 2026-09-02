@@ -517,6 +517,127 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Administrative install (msiexec /a). Exercises the AdminExecuteSequence,
+  # which schedules Action_CloseAppsPrompt UNCONDITIONALLY (Product.wxs:30) --
+  # that is the one immediate managed custom action, and the only one whose
+  # SfxCA stub has to extract and host the CLR before any managed code runs.
+  #
+  # READ THIS BEFORE TRUSTING A GREEN HERE. This leg would NOT have caught the
+  # defect it was written in response to. On 2026-09-02 a pinned WiX 3.11.2 build
+  # and an unpinned 3.14 build both failed `msiexec /a` with
+  # "SFXCA: Failed to create temp directory. Error code 5" on a corporate
+  # Windows 11 Enterprise machine, while a post-DTF-migration build succeeded.
+  # A GitHub-hosted runner is Windows Server, runs as a local administrator and
+  # carries no hardening baseline, so the temp-directory create does not get
+  # ACCESS_DENIED there. This leg is a POSITIVE assertion that SfxCA extracts and
+  # the managed CA enters -- which nothing else asserts anywhere -- and not
+  # coverage of the reported user-facing symptom. Do not read it as the latter.
+  admin-install-test:
+    name: Administrative install (msiexec /a)
+    needs: [resolve, build]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download .msi artefact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: installer-${{ needs.resolve.outputs.release_type }}-${{ github.run_id }}
+          path: msi
+
+      - name: Administrative install
+        # OFFICEREGKEYS="" is load-bearing, not tidiness. On a SUCCESSFUL /a the
+        # deferred CaRegisterAddIn also runs (its condition is NOT Installed) and
+        # writes OPEN values into HKCU\Software\Microsoft\Office\<ver>\Excel\Options
+        # pointing at ASSEMBLIESDIR -- which for an administrative install is the
+        # throwaway image directory. That would leave a broken Excel add-in
+        # registration behind. CaRegisterAddIn skips its entire body when the
+        # OFFICEREGKEYS list is empty, so passing it empty neutralises this.
+        #
+        # /qn is safe here despite Action_CloseAppsPrompt being a WinForms dialog:
+        # the dialog only appears when EXCEL is already running, which it is not
+        # on a runner.
+        run: |
+          $msi = (Get-Item msi\*.msi | Select-Object -First 1).FullName
+          $root = Join-Path $env:RUNNER_TEMP 'adminimage'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Write-Host "Administrative install of $msi into $root"
+          $p = Start-Process msiexec -ArgumentList @(
+                 '/a', "`"$msi`"", '/qn', '/L*V', 'admin-install.log',
+                 "TARGETDIR=`"$root`"", 'OFFICEREGKEYS=""'
+               ) -Wait -PassThru
+          Write-Host "::notice::msiexec /a exit code: $($p.ExitCode)"
+
+      - name: Convert admin-install log to UTF-8 (MSI logs are UTF-16LE)
+        if: always()
+        run: Get-Content admin-install.log | Set-Content admin-install.utf8.log -Encoding utf8
+
+      - name: Assert SfxCA extracted and the managed custom action entered
+        # ASSERTED ON LOG MARKERS, NOT ON THE EXIT CODE, deliberately. A
+        # UI-showing immediate custom action can return 1603 for want of an
+        # interactive desktop, which is a completely different failure from the
+        # SfxCA one and would otherwise be indistinguishable. Equally, a green
+        # exit code alone does not prove the managed CA ran -- so the positive
+        # marker is required, not just the absence of the negative one.
+        run: |
+          $log = Get-Content admin-install.utf8.log -Raw
+
+          if ($log -match 'SFXCA: Failed to create temp directory') {
+              throw "SfxCA could not extract the managed custom action: 'SFXCA: Failed to create temp directory' present in the admin-install log. This is the failure mode that a WiX v3.11.2 pin did NOT prevent; see the retained logs referenced in the build job comments."
+          }
+
+          if ($log -notmatch 'SFXCA: Extracting custom action to temporary directory') {
+              throw "No SfxCA extraction line in the log. The managed custom action was never unpacked, so this run proves nothing about it."
+          }
+
+          if ($log -notmatch 'Begin PromptToCloseApplications') {
+              throw "SfxCA extracted but the managed custom action never entered: 'Begin PromptToCloseApplications' absent. Managed code did not run."
+          }
+
+          if ($log -notmatch 'End PromptToCloseApplications') {
+              throw "The managed custom action entered but did not complete: 'Begin PromptToCloseApplications' present, 'End' absent."
+          }
+
+          Write-Host "::notice::SfxCA extracted, CLR bound, and the managed custom action ran to completion."
+
+      - name: Assert the admin image was populated
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'adminimage'
+          $n = @(Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "::notice::admin image file count: $n"
+          if ($n -lt 100) { throw "Administrative install produced only $n files under $root, expected a full payload." }
+
+      - name: Assert no Excel add-in registration was left behind
+        # Guards the OFFICEREGKEYS="" mitigation above rather than trusting it.
+        if: always()
+        run: |
+          $leaked = @()
+          Get-ChildItem 'HKCU:\Software\Microsoft\Office' -ErrorAction SilentlyContinue | ForEach-Object {
+              $k = "HKCU:\Software\Microsoft\Office\$($_.PSChildName)\Excel\Options"
+              if (Test-Path $k) {
+                  (Get-ItemProperty $k).PSObject.Properties |
+                      Where-Object { $_.Name -like 'OPEN*' -and $_.Value -match 'adminimage|RUNNER_TEMP|Temp' } |
+                      ForEach-Object { $leaked += "$k :: $($_.Name) = $($_.Value)" }
+              }
+          }
+          if ($leaked.Count -gt 0) {
+              throw "CaRegisterAddIn wrote OPEN values pointing at the throwaway admin image, so OFFICEREGKEYS='' did not suppress it: $($leaked -join ' | ')"
+          }
+          Write-Host "::notice::no Excel add-in registration left behind."
+
+      - name: Upload admin-install log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: admin-install-log-${{ github.run_id }}
+          path: |
+            admin-install.log
+            admin-install.utf8.log
+          if-no-files-found: warn
+          retention-days: 14
+
   # Publish the .msi as a preserved per-build GitHub Release. The flavour
   # is determined by what triggered the run, normalised in the resolve job:
   #
@@ -536,7 +657,7 @@ jobs:
   # "Upload installer artefact" Actions artifact for local debugging.
   publish:
     name: Publish ${{ needs.resolve.outputs.release_type }} release
-    needs: [resolve, build, install-test]
+    needs: [resolve, build, install-test, admin-install-test]
     # Skipped when should_publish=false (scheduled nightly + rule 3 soft trip:
     # v{M}.{N}.0 already shipped on this line). Build + install-test still ran
     # to preserve the smoke signal; the post-ship-bump-needed job below opens
