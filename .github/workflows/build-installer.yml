@@ -149,89 +149,51 @@ jobs:
       # BuroHappold_Installer (which bundles private BHE repos), add the
       # mint-dep-token step here.
 
-      - name: Restore build-tools cache (WiX + net40 ref assemblies)
-        # Caches the two pieces of external tooling the build job sets up on
-        # every run: WiX Toolset v3.11.2 (choco-installed) and the .NET
-        # Framework 4.0 reference-assembly targeting pack (nuget + manual
-        # copy). Both are version-pinned and the steps that produce them
-        # take 1-2 minutes combined on a cold runner — including the
-        # occasional multi-minute choco-mirror stall observed on 2026-06-17.
-        # Cache hit skips both installs and goes straight to env-var setup.
-        # Cache key bumps when WiX version, net40-refs version, or runner
-        # image changes; manual invalidation by bumping the trailing -vN.
-        # BHoM dependency repos are NOT cached here — they are cloned and
-        # built fresh per dispatch by Build-Installer.ps1.
-        id: tools-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-        with:
-          path: |
-            C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0
-            C:\Program Files (x86)\WiX Toolset v3.11
-          key: build-tools-${{ runner.os }}-wix3.11.2-net40refs1.0.3-v1
-
-      # The "Provide .NET Framework 4.0 reference assemblies" step that used to
-      # sit here is gone. InstallerCA was the only net40 consumer in the
-      # solution (BHoM_Installer.sln holds exactly three projects, and it is the
-      # only .csproj), and it now targets net472 with DTF supplied by the
-      # WixToolset.Dtf.CustomAction package, so nothing asks MSBuild for a v4.0
-      # targeting pack and MSB3644 cannot fire.
+      # Three steps used to sit here and all three are deliberately gone:
+      # the build-tools cache, the WiX v3.11.2 pin, and the WiX env-var surgery.
       #
-      # The cache step above still lists the v4.0 reference-assembly directory in
-      # its `path` and still names net40refs in its key. Both are now vestigial:
-      # on a miss nothing creates that directory and the save simply skips it.
-      # Left in place deliberately rather than tidied in the same change, because
-      # the whole cache step is under review alongside the WiX pin and should be
-      # removed as one decision, not trimmed twice.
+      # WHY THE PIN WENT. Its comment said it existed because "the v3.14
+      # SfxCA.dll stub (bundled by MakeSfxCA into InstallerCA.CA.dll) appears to
+      # be the source of 'SFXCA: Failed to create temp directory. Error code 5'".
+      # Two things falsify that, both measured on 2026-09-02 rather than reasoned:
       #
-      # Note for the downstream installer that shares InstallerCA: only the net40
-      # half of its equivalent step is retired by this change. Its net46 half must
-      # stay, because it serves that repository's own projects rather than
-      # InstallerCA. Do not delete it by symmetry with this one.
-      - name: Pin WiX Toolset v3.11.2
-        if: steps.tools-cache.outputs.cache-hit != 'true'
-        # GHA windows-2025-vs2026 ships WiX v3.14. The v3.14 SfxCA.dll stub
-        # (bundled by MakeSfxCA into InstallerCA.CA.dll) appears to be the
-        # source of "SFXCA: Failed to create temp directory. Error code 5"
-        # on hardened Windows 11 per-user installs. v3.11.2 has been the
-        # long-stable build BHoMBot uses; pinning to that for parity until
-        # we migrate to WiX v5 in Phase 2.
-        run: |
-          Write-Host "=== WiX directories on runner (before) ==="
-          Get-ChildItem 'C:\Program Files (x86)' -Filter 'WiX*' -Directory | Select-Object FullName | Format-Table -AutoSize | Out-String | Write-Host
-
-          # Remove pre-installed WiX v3.14 so v3.11.2 installs cleanly to its own path.
-          # The choco package's underlying .exe installer no-ops if any v3.x is present,
-          # which is why our previous attempt "succeeded" without actually downgrading.
-          choco uninstall wixtoolset -y --no-progress --skip-autouninstaller-failure-check || Write-Host "(no existing choco wixtoolset to uninstall)"
-          Get-ChildItem 'C:\Program Files (x86)' -Filter 'WiX Toolset v3.*' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-              Write-Host "Removing $($_.FullName)"
-              Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-          }
-
-          choco install wixtoolset --version=3.11.2 --force -y --no-progress
-
-          Write-Host ""
-          Write-Host "=== WiX directories on runner (after) ==="
-          Get-ChildItem 'C:\Program Files (x86)' -Filter 'WiX*' -Directory | Select-Object FullName | Format-Table -AutoSize | Out-String | Write-Host
-
-      - name: Configure WiX env vars
-        # GITHUB_ENV and GITHUB_PATH exports do not survive across step
-        # boundaries on a cache HIT (the install step that previously set
-        # them is skipped). Resolve the WiX root from disk and export
-        # WIX + PATH unconditionally so downstream MSBuild and candle/light
-        # invocations resolve the pinned v3.11.2 binaries regardless of
-        # whether the cache hit or missed.
-        run: |
-          $wixRoot = Get-ChildItem 'C:\Program Files (x86)' -Filter 'WiX Toolset v3.11*' -Directory -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $wixRoot) { throw "WiX 3.11 install missing under C:\Program Files (x86) (cache restore failed or install step did not run)" }
-          $wixBin = Join-Path $wixRoot 'bin'
-          if (-not (Test-Path $wixBin)) { throw "WiX 3.11 install missing bin\: $wixBin" }
-
-          "WIX=$wixRoot\"   | Out-File -FilePath $env:GITHUB_ENV  -Append
-          "$wixBin"         | Out-File -FilePath $env:GITHUB_PATH -Append
-          Write-Host "Pinned WiX root: $wixRoot"
-          & "$wixBin\candle.exe" -? | Select-Object -First 1 | Write-Host
-
+      #   1. The pin no longer controls that stub at all. Since InstallerCA moved
+      #      to WixToolset.Dtf.CustomAction, MakeSfxCA and SfxCA.dll come from the
+      #      package, not from a machine-wide WiX install. The pin only ever
+      #      reached candle/light/heat after that change.
+      #   2. The pin never prevented the failure anyway. An administrative install
+      #      (msiexec /a, which schedules Action_CloseAppsPrompt unconditionally)
+      #      reproduces "SFXCA: Failed to create temp directory. Error code 5"
+      #      IDENTICALLY from a 3.11.2-built MSI and a 3.14-built one. Same error,
+      #      same 1603, and in both cases the managed custom action never entered,
+      #      so the failure is in the stub's own extraction. The pin was protecting
+      #      against something it did not prevent.
+      #
+      # WHY REMOVING IT IS SAFE FOR THE PACKAGE. Measured: a build with the pin
+      # disabled and the image's own WiX v3.14 produced a package whose file
+      # manifest is identical to the pinned build's across all 812 entries, on
+      # provably identical payload inputs (45 dependencies, zero SHA differences).
+      # The only WiX-attributable difference anywhere was 22 bytes in the
+      # InstallerCA.CA.dll Binary stream, which is the SfxCA wrapper, and which
+      # point 1 above has already moved out of the pin's reach.
+      #
+      # WHY THE CACHE WENT. It cached exactly two things and both are now
+      # vestigial: the WiX install (the image's own is equivalent, per above) and
+      # the .NET Framework 4.0 reference assemblies (InstallerCA targets net472
+      # now, so nothing asks for a v4.0 targeting pack). It was also keyed on
+      # runner.os, which evaluates to "Windows" and does not vary by image, while
+      # caching an executable toolchain that later runs candle.exe. Removing it
+      # closes that rather than re-keying it.
+      #
+      # WHY THE ENV-VAR STEP WENT. It existed to point WIX and PATH at the pinned
+      # 3.11.2 binaries, and to survive a cache hit that skipped the install step.
+      # With no pin and no cache, the image's own WiX registers itself and MSBuild
+      # resolves the WiX targets normally.
+      #
+      # STILL OPEN, and not what this change is about: the SFXCA temp-directory
+      # failure is real and reproduces on a corporate Windows 11 Enterprise
+      # machine on the msiexec /a path. It is not caused by the WiX version. A
+      # /L*V log of it now exists. Whatever the cause is, pinning did not fix it.
       - name: Build installer
         id: build
         env:
