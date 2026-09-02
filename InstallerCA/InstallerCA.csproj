@@ -1,74 +1,92 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<Project ToolsVersion="12.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Managed custom actions for the BHoM installer.
+
+    SDK-style, targeting net472, with the DTF tooling supplied by the
+    WixToolset.Dtf.CustomAction package rather than by a machine-wide WiX v3
+    install. Both .wixproj files deliberately stay on WiX v3 for now: a custom
+    action project can be upgraded independently of the packaging projects, so
+    this is the smallest change that removes the net40 dependency and puts the
+    DTF version under our control.
+  -->
+
   <PropertyGroup>
-    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
-    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
-    <ProductVersion>8.0.30703</ProductVersion>
-    <SchemaVersion>2.0</SchemaVersion>
-    <ProjectGuid>{639D9368-7833-42B3-B166-6FEF55A21001}</ProjectGuid>
+    <TargetFramework>net472</TargetFramework>
     <OutputType>Library</OutputType>
-    <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>InstallerCA</RootNamespace>
     <AssemblyName>InstallerCA</AssemblyName>
-    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
-    <FileAlignment>512</FileAlignment>
-    <WixCATargetsPath Condition=" '$(WixCATargetsPath)' == '' ">$(MSBuildExtensionsPath)\Microsoft\WiX\v3.x\Wix.CA.targets</WixCATargetsPath>
+    <Platforms>AnyCPU</Platforms>
+
+    <!-- Properties\AssemblyInfo.cs is checked in and still compiled, so the SDK
+         must not generate a second set of the same attributes. -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+
+    <!-- The old project emitted to bin\<Config>\ with no TFM subfolder, and
+         BHoM_Installer.wixproj picks the output up by ProjectReference. Keeping
+         the output path shape identical means the packaging side does not have
+         to change in this step. -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
-  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
-    <DebugSymbols>true</DebugSymbols>
-    <DebugType>full</DebugType>
-    <Optimize>false</Optimize>
-    <OutputPath>bin\Debug\</OutputPath>
-    <DefineConstants>DEBUG;TRACE</DefineConstants>
-    <ErrorReport>prompt</ErrorReport>
-    <WarningLevel>4</WarningLevel>
-  </PropertyGroup>
-  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
-    <DebugType>pdbonly</DebugType>
-    <Optimize>true</Optimize>
-    <OutputPath>bin\Release\</OutputPath>
-    <DefineConstants>TRACE</DefineConstants>
-    <ErrorReport>prompt</ErrorReport>
-    <WarningLevel>4</WarningLevel>
-  </PropertyGroup>
+
+  <!--
+    InstallerClass.cs and InstallerClass.Designer.cs are on disk but were NOT in
+    the old project's explicit <Compile> list, so they have never been compiled.
+    SDK-style projects glob **/*.cs, which would silently start compiling them
+    and change what ships. Excluded to keep this change behaviour-preserving.
+
+    Nothing in the compiled sources references InstallerClass, so deleting the
+    two files is probably the right end state. That is a separate decision and
+    is deliberately not taken here.
+  -->
   <ItemGroup>
-    <Reference Include="Microsoft.Deployment.WindowsInstaller, Version=3.0.0.0, Culture=neutral, PublicKeyToken=ce35f76fcda82bad, processorArchitecture=MSIL">
-      <SpecificVersion>False</SpecificVersion>
-      <HintPath>..\..\..\..\Program Files (x86)\ISWIX LLC\IsWiX\Microsoft.Deployment.WindowsInstaller.dll</HintPath>
-      <Private>True</Private>
-    </Reference>
+    <Compile Remove="InstallerClass.cs" />
+    <Compile Remove="InstallerClass.Designer.cs" />
+  </ItemGroup>
+
+  <!--
+    Framework references carried over verbatim from the old project. SDK-style
+    .NET Framework projects do not reference System.Windows.Forms or
+    System.Drawing implicitly, and ClosePromptForm / PromptCloseApplication /
+    WindowWrapper all need them: the close-apps prompt is a WinForms dialog.
+  -->
+  <ItemGroup>
     <Reference Include="System" />
     <Reference Include="System.Core" />
+    <Reference Include="System.Data" />
+    <Reference Include="System.Data.DataSetExtensions" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Windows.Forms" />
-    <Reference Include="System.Xml.Linq" />
-    <Reference Include="System.Data.DataSetExtensions" />
-    <Reference Include="Microsoft.CSharp" />
-    <Reference Include="System.Data" />
     <Reference Include="System.Xml" />
+    <Reference Include="System.Xml.Linq" />
+    <Reference Include="Microsoft.CSharp" />
   </ItemGroup>
-  <ItemGroup>
-    <Compile Include="ClosePromptForm.cs">
-      <SubType>Form</SubType>
-    </Compile>
-    <Compile Include="ClosePromptForm.designer.cs">
-      <DependentUpon>ClosePromptForm.cs</DependentUpon>
-    </Compile>
-    <Compile Include="CustomAction.cs" />
-    <Compile Include="PromptCloseApplication.cs" />
-    <Compile Include="Properties\AssemblyInfo.cs" />
-    <Compile Include="WindowWrapper.cs" />
-  </ItemGroup>
+
+  <!--
+    CustomAction.config is the CLR host config SfxCA reads when it starts the
+    managed CA. Its supportedRuntime value is v4.0, which is the CLR version,
+    not the target framework: net472 runs on CLR v4.0, so retargeting does not
+    change it. Do not "update" it to match the TFM.
+  -->
   <ItemGroup>
     <Content Include="CustomAction.config" />
   </ItemGroup>
-  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
-  <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
-       Other similar extension points exist, see Microsoft.Common.targets.
-  <Target Name="BeforeBuild">
-  </Target>
-  <Target Name="AfterBuild">
-  </Target>
+
+  <!--
+    Replaces two things at once:
+      - the WixCATargetsPath import of Wix.CA.targets from a machine-wide WiX
+        v3 install, which is what forced WiX to be choco-installed at build
+        time; and
+      - a <Reference> to Microsoft.Deployment.WindowsInstaller resolved by
+        HintPath into "Program Files (x86)\ISWIX LLC\IsWiX\", an unrelated
+        third-party product that is not installed on the CI runner.
+
+    Version 5.0.2 deliberately. It is the newest release before the Open Source
+    Maintenance Fee applies (OSMF starts at v6.0.0), so this probe stays
+    procurement-neutral while the fee question is decided separately.
   -->
-  <Import Project="$(WixCATargetsPath)" />
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Dtf.CustomAction" Version="5.0.2" />
+  </ItemGroup>
+
 </Project>

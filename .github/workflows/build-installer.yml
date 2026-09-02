@@ -169,46 +169,24 @@ jobs:
             C:\Program Files (x86)\WiX Toolset v3.11
           key: build-tools-${{ runner.os }}-wix3.11.2-net40refs1.0.3-v1
 
-      - name: Provide .NET Framework 4.0 reference assemblies
-        if: steps.tools-cache.outputs.cache-hit != 'true'
-        # InstallerCA.csproj targets .NET Framework v4.0, matching BHoMBot's
-        # build exactly so that the installer source tree stays untouched. The
-        # windows-2025-vs2026 image ships no v4.0 targeting pack, so MSBuild
-        # errors with MSB3644 unless v4.0 reference assemblies are available
-        # in a location it knows to look.
-        #
-        # Restore them via the standard NuGet package and copy into the
-        # canonical Visual Studio targeting-pack location:
-        #   C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0\
-        # MSBuild's GetReferenceAssemblyPaths task then resolves v4.0 there
-        # naturally, as if the .NET Framework 4.0 SDK were installed.
-        #
-        # A Directory.Build.props / FrameworkPathOverride approach was tried
-        # first and abandoned: that file is imported into project evaluation
-        # before the csproj sets TargetFrameworkVersion, so a conditional
-        # 'TargetFrameworkVersion == v4.0' never matches and the override is
-        # never applied. The cached-binaries from earlier sessions masked this
-        # until the cache was removed.
-        #
-        # v4.8 and later TFMs are unaffected. Their targeting packs live at
-        # separate per-version paths and are not touched by this step.
-        run: |
-          $pkgDir = 'C:\refasms'
-          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
-          nuget install Microsoft.NETFramework.ReferenceAssemblies.net40 `
-            -OutputDirectory $pkgDir -Version 1.0.3 -ExcludeVersion -Verbosity quiet `
-            -Source https://api.nuget.org/v3/index.json
-          $src = "$pkgDir\Microsoft.NETFramework.ReferenceAssemblies.net40\build\.NETFramework\v4.0"
-          if (-not (Test-Path "$src\mscorlib.dll")) {
-              throw "v4.0 ref assemblies missing at $src after nuget install"
-          }
-
-          $dst = 'C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.0'
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
-          Copy-Item -Path "$src\*" -Destination $dst -Recurse -Force
-          Write-Host "Installed v4.0 reference assemblies to: $dst"
-          Get-ChildItem $dst -Filter '*.dll' | Measure-Object | ForEach-Object { Write-Host "  $($_.Count) DLLs present" }
-
+      # The "Provide .NET Framework 4.0 reference assemblies" step that used to
+      # sit here is gone. InstallerCA was the only net40 consumer in the
+      # solution (BHoM_Installer.sln holds exactly three projects, and it is the
+      # only .csproj), and it now targets net472 with DTF supplied by the
+      # WixToolset.Dtf.CustomAction package, so nothing asks MSBuild for a v4.0
+      # targeting pack and MSB3644 cannot fire.
+      #
+      # The cache step above still lists the v4.0 reference-assembly directory in
+      # its `path` and still names net40refs in its key. Both are now vestigial:
+      # on a miss nothing creates that directory and the save simply skips it.
+      # Left in place deliberately rather than tidied in the same change, because
+      # the whole cache step is under review alongside the WiX pin and should be
+      # removed as one decision, not trimmed twice.
+      #
+      # Note for the downstream installer that shares InstallerCA: only the net40
+      # half of its equivalent step is retired by this change. Its net46 half must
+      # stay, because it serves that repository's own projects rather than
+      # InstallerCA. Do not delete it by symmetry with this one.
       - name: Pin WiX Toolset v3.11.2
         if: steps.tools-cache.outputs.cache-hit != 'true'
         # GHA windows-2025-vs2026 ships WiX v3.14. The v3.14 SfxCA.dll stub
