@@ -81,6 +81,29 @@ concurrency:
   group: build-installer-${{ github.event_name }}
   cancel-in-progress: false
 
+env:
+  # Pinned WiX-v3-built baseline MSI for the upgrade-test job.
+  #
+  # A published release asset, deliberately, and not either of the two
+  # alternatives:
+  #   - a retained Actions artefact has 30-day retention, so the leg would begin
+  #     failing a month later with no code change;
+  #   - a build on a "frozen" branch is not frozen. Its dependency resolution
+  #     keeps moving, so the baseline would quietly stop being a v3 comparison,
+  #     and it would add a full dependency clone to every run.
+  #
+  # MOVE THIS TAG DELIBERATELY AND NEVER TO "THE LATEST RELEASE". The whole
+  # value of the pin is that the package predates the WiX toolchain migration.
+  # v9.2.0-alpha.beta.8 was published 2026-07-02: ProductVersion 9.2.1.8,
+  # UpgradeCode {64C4DABF-7D02-4412-B422-953E47C780C8}, RemoveExistingProducts
+  # at sequence 1401, all identical in kind to what the current build produces.
+  UPGRADE_BASELINE_TAG: v9.2.0-alpha.beta.8
+
+  # The product's UpgradeCode, fixed at Product.wxs:4. Used to enumerate
+  # installed products through the Windows Installer API rather than probing a
+  # registry hive; see the upgrade-test header for why that distinction matters.
+  BHOM_UPGRADE_CODE: '{64C4DABF-7D02-4412-B422-953E47C780C8}'
+
 jobs:
   # Normalise the trigger event into the parameters every downstream job
   # needs. Single source of truth for: which release type to build, what
@@ -638,6 +661,605 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Upgrade over an existing install. Installs a pinned WiX-v3-built MSI, installs
+  # this run's MSI over it, and asserts the result against a clean install of the
+  # same MSI taken in the same job.
+  #
+  # WHY THIS EXISTS. Nothing else tests upgrade. install-test and
+  # admin-install-test both only ever touch a clean runner, so
+  # Components.wxs:31-63's RemoveFile entries and the util:RemoveFolderEx block
+  # in the Core component group are code that never executes under test. The MSI
+  # is InstallScope="perUser" with <MajorUpgrade AllowDowngrades="yes" /> and its
+  # Upgrade row is VersionMin 0 with no maximum, so every prior version including
+  # an equal one is detected: upgrade is the normal user experience rather than an
+  # edge case.
+  #
+  # WHAT THIS LEG DELIBERATELY DOES NOT ASSERT: component GUID equality. Measured
+  # 2026-09-03 across two builds of the same commit, 795 of 822 component GUIDs
+  # already differ, because every HeatDirectory in InstallerCore.wixproj runs with
+  # GenerateGuidsNow="true" and assemblies.xslt's KeyPath="no" transform leaves 274
+  # components with a directory keypath, which rules out deterministic Guid="*".
+  # It is harmless because RemoveExistingProducts is sequenced at 1401, so the old
+  # product is removed in full before the new one installs and no component
+  # matching happens across the upgrade. A GUID-equality assertion would fail today
+  # against an unchanged toolchain.
+  #
+  # TWO LIMITS ON A GREEN HERE. Read both before trusting one.
+  #
+  #   1. The baseline predates the InstallerCA migration, so this leg installs the
+  #      OLD net40 custom action and its old SfxCA stub in its baseline phase. That
+  #      is representative of what a user actually has installed, which is the
+  #      point, but it means the baseline phase is not exercising current CA code.
+  #      A baseline-phase failure is a fact about the baseline, not about this run's
+  #      MSI, which is why that phase asserts separately and says so.
+  #
+  #   2. This leg validates upgrade in whatever install context the RUNNER resolves
+  #      to, which is not necessarily the user's. The package is authored perUser
+  #      (ALLUSERS=2, MSIINSTALLPERUSER=1, summary WordCount 10) but msiexec runs
+  #      elevated here, and the nightly log shows ALLUSERS being deleted and
+  #      MSIINSTALLPERUSER ignored while the per-machine ARP entry is nonetheless
+  #      present. Which context wins on the runner is not settled. This leg is
+  #      written to not care: it enumerates products by UpgradeCode through the
+  #      Windows Installer API instead of reading a registry hive. Do not "simplify"
+  #      that back to a hive probe.
+  #
+  # NOT WATCHED BY notify-on-failure. That job's needs are [build, install-test]
+  # and are left alone here, because PR 76 removes the job outright by decision.
+  # So while it still exists, a nightly failure in THIS leg opens no issue. The
+  # reporting decision belongs to whatever replaces that job, not to this change.
+  upgrade-test:
+    name: Upgrade over a v3-built MSI
+    needs: [resolve, build]
+    runs-on: windows-2025
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download this run's .msi artefact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: installer-${{ needs.resolve.outputs.release_type }}-${{ github.run_id }}
+          path: msi
+
+      - name: Download the pinned v3-built baseline MSI
+        # HARD FAILURE, NOT A SKIP. If the baseline cannot be fetched this leg
+        # proves nothing, and a leg that quietly proves nothing while reporting
+        # success is a shape this workflow has already produced twice: a nightly
+        # reporting job whose needs meant it could not fire on the failure it
+        # existed to catch, and a toolchain pin whose stated justification turned
+        # out never to have been verified. Because publish gates on this job, a
+        # 404 here blocks the release, which is the correct outcome: it means the
+        # upgrade path went untested.
+        #
+        # The tag is named explicitly rather than resolved. `gh release download`
+        # with no tag picks the latest NON-prerelease, and every installer release
+        # is published as a pre-release, so an unnamed download finds nothing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:UPGRADE_BASELINE_TAG
+          Write-Host "Baseline tag: $tag"
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern '*.msi' --dir baseline
+          if ($LASTEXITCODE -ne 0) {
+              throw "Could not download the pinned baseline MSI from release '$tag' in $env:GITHUB_REPOSITORY. This leg cannot run without it and must not report success without it. Check the tag in the workflow-level UPGRADE_BASELINE_TAG env and that its .msi asset still exists."
+          }
+
+          $found = @(Get-ChildItem baseline -Filter *.msi -File)
+          if ($found.Count -ne 1) {
+              throw "Expected exactly one .msi asset on release '$tag', found $($found.Count): $($found.Name -join ', ')"
+          }
+          if ($found[0].Length -lt 1MB) {
+              throw "Baseline MSI $($found[0].Name) is only $($found[0].Length) bytes, which cannot be a real payload."
+          }
+          Write-Host "::notice::Baseline MSI: $($found[0].Name) ($([math]::Round($found[0].Length / 1MB, 2)) MB)"
+          "BASELINE_MSI=$($found[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Read the baseline's ProductCode
+        # Captured so the upgrade assertion can prove THIS baseline product was the
+        # one removed, rather than merely that some upgrade happened. Read from the
+        # package rather than hardcoded, so re-pointing UPGRADE_BASELINE_TAG needs
+        # no second edit.
+        run: |
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db   = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($env:BASELINE_MSI, 0))
+          $sql  = 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode'''
+          $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($sql))
+          $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+          $rec  = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+          if ($null -eq $rec) { throw "Baseline MSI has no ProductCode property, so it is not a valid package." }
+          $code = [string]$rec.GetType().InvokeMember('StringData', 'GetProperty', $null, $rec, @(1))
+          if (-not $code) { throw "Baseline ProductCode read back empty." }
+          Write-Host "::notice::Baseline ProductCode: $code"
+          "BASELINE_PRODUCT_CODE=$code" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Write the shared tree-snapshot helper
+        # Single-sourced on purpose. The whole leg turns on comparing two trees, so
+        # both snapshots must be taken by identical code; two inline copies that
+        # drift by a -Force or a sort order would produce a difference that looks
+        # like a packaging defect.
+        run: |
+          $helper = Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1'
+          @'
+          $BHoMRoot = 'C:\ProgramData\BHoM'
+
+          # ARRAY SEMANTICS ARE ENFORCED AT THE CALL SITES, WITH @(), AND NOWHERE
+          # ELSE. Both of these accessors emit normally, so a single result unrolls
+          # to a bare string on return and @() re-wraps it. Every one of the twelve
+          # call sites does that, and there are no exceptions to check for.
+          #
+          # Do not "harden" these functions with Write-Output -NoEnumerate. It does
+          # not compose with @(): -NoEnumerate emits the array as ONE object, which
+          # @() then wraps again, so the caller gets a one-element array containing
+          # the array. Both mistakes have been made here in sequence. The first
+          # (@() missing) produced "msiexec /f {" and exit 1619; the second
+          # (-NoEnumerate added as well) produced a reference tree of "1 files".
+          # One mechanism, at the call site.
+          function Get-BHoMTree {
+              if (-not (Test-Path $BHoMRoot)) { return @() }
+              Get-ChildItem $BHoMRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
+                  ForEach-Object { $_.FullName.Substring($BHoMRoot.Length).TrimStart('\') } |
+                  Sort-Object
+          }
+
+          function Get-BHoMProducts {
+              # Enumerate installed products sharing the product's UpgradeCode, via
+              # the Windows Installer API. Context-agnostic by design: see the job
+              # header on why a registry-hive probe is the wrong instrument here.
+              $installer = New-Object -ComObject WindowsInstaller.Installer
+              try {
+                  $list = $installer.GetType().InvokeMember('RelatedProducts', 'GetProperty', $null, $installer, @($env:BHOM_UPGRADE_CODE))
+              } catch {
+                  return @()
+              }
+              if ($null -eq $list) { return @() }
+              $n = $list.GetType().InvokeMember('Count', 'GetProperty', $null, $list, $null)
+              $out = @()
+              for ($i = 0; $i -lt $n; $i++) {
+                  $out += [string]$list.GetType().InvokeMember('Item', 'GetProperty', $null, $list, @($i))
+              }
+              $out
+          }
+
+          function Get-MsiFileVersions {
+              # Map of long file name -> array of DISTINCT versions declared for that
+              # name anywhere in the MSI. An array rather than a single value because
+              # a name can legitimately appear in more than one directory: the payload
+              # ships BHoM_Engine.dll and BHoM_Adapter.dll in both ASSEMBLIESDIR and
+              # GRASSHOPPERPLUGINDIR. Keeping only the first would silently pick one
+              # if they ever diverged, so the caller is given the choice and can
+              # refuse an ambiguous probe.
+              #
+              # Returns a hashtable, which does not unroll on return, so it needs
+              # none of the @() handling the two list accessors above do.
+              param([string]$MsiPath)
+              $map = @{}
+              $installer = New-Object -ComObject WindowsInstaller.Installer
+              $db   = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($MsiPath, 0))
+              $sql  = 'SELECT `FileName`,`Version` FROM `File`'
+              $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($sql))
+              $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+              while ($true) {
+                  $rec = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+                  if ($null -eq $rec) { break }
+                  $name = [string]$rec.GetType().InvokeMember('StringData', 'GetProperty', $null, $rec, @(1))
+                  $ver  = [string]$rec.GetType().InvokeMember('StringData', 'GetProperty', $null, $rec, @(2))
+                  # FileName is "shortname|longname"; the long name is what lands on disk.
+                  $long = if ($name -match '\|') { $name.Split('|')[-1] } else { $name }
+                  if ($long) {
+                      if ($map.ContainsKey($long)) {
+                          if ($map[$long] -notcontains $ver) { $map[$long] += $ver }
+                      } else {
+                          $map[$long] = @($ver)
+                      }
+                  }
+              }
+              $map
+          }
+
+          function Get-OnDiskFileVersion {
+              # Normalised through FileVersionInfo's parts rather than its
+              # FileVersion string, which is free-form and does not always match
+              # the dotted quad the MSI File table records.
+              param([string]$Path)
+              $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+              "$($vi.FileMajorPart).$($vi.FileMinorPart).$($vi.FileBuildPart).$($vi.FilePrivatePart)"
+          }
+
+          function Assert-ProductCode {
+              # Guards against handing msiexec something that is not a product code.
+              # Without this, a malformed value reaches msiexec and comes back as a
+              # generic 1619 with no log, which reads as a product defect rather
+              # than as a scripting bug. That misattribution already happened once.
+              param([string]$Value, [string]$Context)
+              if ($Value -notmatch '^\{[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}$') {
+                  throw "$Context expected a product code and got '$Value'. This is a fault in this workflow, not in the installer."
+              }
+          }
+
+          function Invoke-Msi {
+              # $args is an automatic variable in PowerShell, hence $msiArgs.
+              param([string[]]$Arguments, [string]$LogName)
+              $msiArgs = $Arguments + @('/L*V', $LogName, '/passive')
+              $p = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru
+
+              # Converted here rather than in a separate step so that every
+              # transaction's log is readable even when its caller throws. Guarded
+              # because a transaction that never started writes no log, and losing
+              # the exit code to a conversion error would destroy the attribution
+              # this leg is built around.
+              if (Test-Path $LogName) {
+                  Get-Content $LogName -Encoding Unicode | Set-Content "$LogName.utf8.log" -Encoding UTF8
+              } else {
+                  Write-Host "::warning::msiexec produced no log at $LogName, so exit code $($p.ExitCode) is all the evidence there is."
+              }
+              $p.ExitCode
+          }
+          '@ | Set-Content -Path $helper -Encoding UTF8
+          Write-Host "Helper written to $helper"
+
+      # ---- Phase A: clean install of THIS run's MSI, to produce the reference tree.
+
+      - name: 'Phase A: clean-install this run''s MSI'
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          $msi = (Get-Item msi\*.msi | Select-Object -First 1).FullName
+          "NEW_MSI=$msi" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Clean-installing $msi"
+          $rc = Invoke-Msi -Arguments @('/i', $msi) -LogName 'a-clean-install.log'
+          Write-Host "::notice::Phase A /i exit code: $rc"
+          if ($rc -ne 0) { throw "Phase A clean install failed with exit $rc. This is a clean-install failure, which install-test also covers; fix that before reading anything into the upgrade legs." }
+
+      - name: 'Phase A: capture the reference tree'
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          $tree = @(Get-BHoMTree)
+          if ($tree.Count -lt 100) { throw "Reference tree has only $($tree.Count) files under C:\ProgramData\BHoM, which cannot be a full payload. Nothing downstream would be meaningful." }
+          # Written into the working directory, not RUNNER_TEMP. upload-artifact@v4
+          # preserves paths relative to the common ancestor of all its inputs, so a
+          # snapshot under RUNNER_TEMP alongside workspace-relative logs would
+          # silently push everything into a nested layout.
+          $tree | Set-Content -Path 'tree-a.txt' -Encoding UTF8
+          Write-Host "::notice::Reference tree: $($tree.Count) files"
+
+      - name: 'Phase A: uninstall and assert the machine is clean again'
+        # Establishes the precondition for phase B rather than testing anything new.
+        # If uninstall leaves residue, the tree comparison later would be measuring
+        # that residue instead of the upgrade.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          foreach ($code in @(Get-BHoMProducts)) {
+              Write-Host "Removing $code"
+              $rc = Invoke-Msi -Arguments @('/x', $code) -LogName 'a-uninstall.log'
+              if ($rc -ne 0) { throw "Phase A uninstall of $code failed with exit $rc" }
+          }
+          $left = @(Get-BHoMProducts)
+          if ($left.Count -ne 0) { throw "Phase A left $($left.Count) product(s) registered: $($left -join ', ')" }
+          $residue = @(Get-BHoMTree)
+          if ($residue.Count -ne 0) {
+              $residue | ForEach-Object { Write-Host "::error::Residual file after phase A uninstall: $_" }
+              throw "Phase A uninstall left $($residue.Count) file(s) under C:\ProgramData\BHoM. The upgrade comparison cannot start from a dirty machine."
+          }
+          Write-Host "::notice::Phase A uninstall left no products and no files."
+
+      # ---- Phase B: install the pinned v3-built baseline.
+
+      - name: 'Phase B: install the v3-built baseline'
+        # Asserted separately from the upgrade so that attribution is unambiguous.
+        # A failure here is a fact about the pinned baseline package (which carries
+        # the pre-migration net40 custom action), not about this run's MSI.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          Write-Host "Installing baseline $env:BASELINE_MSI"
+          $rc = Invoke-Msi -Arguments @('/i', $env:BASELINE_MSI) -LogName 'b-baseline-install.log'
+          Write-Host "::notice::Phase B /i exit code: $rc"
+          if ($rc -ne 0) { throw "The pinned BASELINE MSI ($env:UPGRADE_BASELINE_TAG) failed to install with exit $rc. This is a failure of the baseline, not of this run's build. Read b-baseline-install.log.utf8.log before touching anything else." }
+
+          $products = @(Get-BHoMProducts)
+          if ($products -notcontains $env:BASELINE_PRODUCT_CODE) {
+              throw "Baseline installed but product $env:BASELINE_PRODUCT_CODE is not registered under UpgradeCode $env:BHOM_UPGRADE_CODE. Found: $($products -join ', ')"
+          }
+          Write-Host "::notice::Baseline registered as $env:BASELINE_PRODUCT_CODE"
+
+      # ---- Phase C: the upgrade itself.
+
+      - name: 'Phase C: install this run''s MSI over the baseline'
+        # ASSERTION 1 of 9: the upgrade transaction itself succeeds.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          Write-Host "Upgrading with $env:NEW_MSI"
+          $rc = Invoke-Msi -Arguments @('/i', $env:NEW_MSI) -LogName 'c-upgrade.log'
+          Write-Host "::notice::Phase C /i exit code: $rc"
+          if ($rc -ne 0) { throw "Upgrade install over the baseline failed with exit $rc" }
+
+      - name: 'Assert the upgrade path was actually taken'
+        # ASSERTION 2 of 9, and the load-bearing one. Without it a SIDE-BY-SIDE
+        # install passes every other assertion in this job and the leg proves
+        # nothing at all. Two markers, because either alone is weak:
+        #   - WIX_UPGRADE_DETECTED is the Upgrade table's ActionProperty, so its
+        #     presence proves FindRelatedProducts matched the baseline, and its
+        #     value proves it matched THIS baseline;
+        #   - RemoveExistingProducts having run proves the match was acted on.
+        run: |
+          $log = Get-Content 'c-upgrade.log.utf8.log' -Raw
+
+          if ($log -notmatch 'WIX_UPGRADE_DETECTED') {
+              throw "WIX_UPGRADE_DETECTED never appears in the upgrade log, so FindRelatedProducts did not match the installed baseline. This was a side-by-side install, not an upgrade, and nothing else in this job means anything."
+          }
+
+          $expected = [regex]::Escape($env:BASELINE_PRODUCT_CODE)
+          if ($log -notmatch "WIX_UPGRADE_DETECTED[^\r\n]*$expected") {
+              Write-Host "::error::Expected WIX_UPGRADE_DETECTED to name $env:BASELINE_PRODUCT_CODE"
+              $log -split "`r?`n" | Select-String -Pattern 'WIX_UPGRADE_DETECTED' | ForEach-Object { Write-Host "::error::$($_.Line.Trim())" }
+              throw "WIX_UPGRADE_DETECTED is set but does not name the baseline ProductCode $env:BASELINE_PRODUCT_CODE. Something other than the package we installed in phase B was detected."
+          }
+
+          if ($log -notmatch 'RemoveExistingProducts') {
+              throw "RemoveExistingProducts does not appear in the upgrade log. The old product was detected but never removed."
+          }
+
+          Write-Host "::notice::Upgrade detected $env:BASELINE_PRODUCT_CODE and ran RemoveExistingProducts."
+
+      - name: 'Assert exactly one product remains'
+        # ASSERTION 3 of 9. Enumerated through the Windows Installer API, not a
+        # registry hive: see limit 2 in the job header.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          $products = @(Get-BHoMProducts)
+          Write-Host "::notice::Products under UpgradeCode $($env:BHOM_UPGRADE_CODE): $($products.Count)"
+          if ($products.Count -ne 1) {
+              $products | ForEach-Object { Write-Host "::error::Registered product: $_" }
+              throw "Expected exactly 1 product after the upgrade, found $($products.Count). More than one means the upgrade installed alongside the baseline instead of replacing it."
+          }
+          # Assert-ProductCode before the comparison, not after. Without the @()
+          # above, $products[0] was the character '{' and this comparison passed
+          # for the wrong reason on the first validation run.
+          Assert-ProductCode -Value $products[0] -Context 'remaining-product assertion'
+          Write-Host "::notice::Remaining product: $($products[0])"
+          if ($products[0] -eq $env:BASELINE_PRODUCT_CODE) {
+              throw "The single remaining product is still the baseline ($env:BASELINE_PRODUCT_CODE). The upgrade did not take."
+          }
+
+      - name: 'Assert the upgraded tree matches a clean install exactly'
+        # ASSERTION 4 of 9. This is the assertion that covers Components.wxs:31-63's
+        # RemoveFile entries and the util:RemoveFolderEx block, and it is the one
+        # that would catch harvest-layout movement across the WiX migration.
+        # Extra path  = an orphan the upgrade failed to clean.
+        # Missing path = a component the upgrade dropped.
+        # Compared by relative path set only. Sizes and hashes are deliberately not
+        # compared here: the baseline is months older than this run's payload, so
+        # content differences between the two are expected and legitimate.
+        #
+        # THE COROLLARY IS THAT THIS ASSERTION IS BLIND TO CONTENT. A stale file the
+        # upgrade failed to overwrite has the same path as its replacement, so it
+        # passes here. Assertion 5 is what covers that, and neither assertion
+        # substitutes for the other.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          $reference = @(Get-Content 'tree-a.txt')
+          $upgraded  = @(Get-BHoMTree)
+          $upgraded | Set-Content -Path 'tree-c.txt' -Encoding UTF8
+
+          # Guarded before Compare-Object, which needs non-empty inputs to say
+          # anything useful. An empty upgraded tree is a total-loss result and is
+          # worth reporting as itself rather than as N missing files.
+          if ($upgraded.Count -eq 0) {
+              throw "Nothing is installed under C:\ProgramData\BHoM after the upgrade, though the transaction exited 0 and RemoveExistingProducts ran. The upgrade removed the baseline and installed nothing."
+          }
+
+          $orphans = @(Compare-Object -ReferenceObject $reference -DifferenceObject $upgraded |
+                       Where-Object { $_.SideIndicator -eq '=>' } | ForEach-Object { $_.InputObject })
+          $missing = @(Compare-Object -ReferenceObject $reference -DifferenceObject $upgraded |
+                       Where-Object { $_.SideIndicator -eq '<=' } | ForEach-Object { $_.InputObject })
+
+          Write-Host "::notice::Clean-install tree: $($reference.Count) files. Upgraded tree: $($upgraded.Count) files. Orphans: $($orphans.Count). Missing: $($missing.Count)."
+
+          $orphans | ForEach-Object { Write-Host "::error::Orphan left by the upgrade: $_" }
+          $missing | ForEach-Object { Write-Host "::error::Missing after the upgrade: $_" }
+
+          if ($orphans.Count -or $missing.Count) {
+              throw "Upgraded tree differs from a clean install of the same MSI: $($orphans.Count) orphan(s), $($missing.Count) missing. Both are upgrade-path defects that a clean-install test cannot see."
+          }
+
+      - name: 'Assert file CONTENT was replaced, not just paths'
+        # ASSERTION 5 of 9, and it exists because assertion 4 cannot see this class
+        # of failure at all. That comparison matches PATH SETS, and a stale file
+        # left behind by an overwrite that did not happen has exactly the same
+        # path as the file that should have replaced it. Path-set equality would
+        # report green on an upgrade that changed nothing.
+        #
+        # This reads the expected version out of the new MSI's own File table
+        # rather than hardcoding it, so it needs no edit when versions move.
+        #
+        # NON-VACUITY IS ASSERTED FIRST, AND THAT ORDER IS DELIBERATE. If a probe
+        # carries the same version in both packages, comparing the installed file
+        # against the new version proves nothing: a stale baseline file would pass
+        # it. So the step requires at least one probe whose version genuinely
+        # differs between baseline and new, and fails loudly if none does, rather
+        # than reporting a green that means nothing. A probe set that stops
+        # discriminating because the versions converged is a broken test, and this
+        # says so instead of hiding it.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+
+          $probes = @('BHoM_Engine.dll', 'BHoM_Adapter.dll', 'BHoMUpgrades.dll')
+          $newVersions  = Get-MsiFileVersions -MsiPath $env:NEW_MSI
+          $baseVersions = Get-MsiFileVersions -MsiPath $env:BASELINE_MSI
+
+          $checked = 0
+          $discriminating = 0
+          $failures = @()
+
+          foreach ($probe in $probes) {
+              # EVERY copy on disk is checked, not just a uniquely-resolving one.
+              # An earlier version of this step skipped any probe that resolved to
+              # more than one file, which quietly dropped 2 of 3 probes because two
+              # of them ship in ASSEMBLIESDIR and GRASSHOPPERPLUGINDIR both. The
+              # step still went green on the one survivor. Checking every copy is
+              # both safer and stronger: it covers a second directory that
+              # RemoveFolderEx also wipes.
+              $expectedVersions = @($newVersions[$probe])
+              $baselineVersions = @($baseVersions[$probe])
+
+              if ($expectedVersions.Count -ne 1) {
+                  Write-Host "::warning::Probe $probe declares $($expectedVersions.Count) distinct versions in the new MSI ($($expectedVersions -join ', ')), so there is no single expected value. Skipping it."
+                  continue
+              }
+              $expected = $expectedVersions[0]
+              if (-not $expected) {
+                  Write-Host "::warning::Probe $probe carries no version in the new MSI, skipping it."
+                  continue
+              }
+
+              $baseline = $null
+              if ($baselineVersions.Count -eq 1) { $baseline = $baselineVersions[0] }
+
+              $found = @(Get-ChildItem $BHoMRoot -Recurse -File -Filter $probe -ErrorAction SilentlyContinue)
+              if ($found.Count -eq 0) {
+                  Write-Host "::warning::Probe $probe is not present on disk after the upgrade, skipping it."
+                  continue
+              }
+
+              $checked += $found.Count
+
+              $discriminates = $baseline -and ($baseline -ne $expected)
+              if ($discriminates) { $discriminating++ }
+
+              # Written without the PowerShell 7 ternary deliberately, so this
+              # script stays parseable by Windows PowerShell 5.1 and can be
+              # syntax-checked outside a runner.
+              $shownBaseline = '(absent)'
+              if ($baseline) { $shownBaseline = $baseline }
+              $marker = ''
+              if (-not $discriminates) { $marker = '  [does NOT discriminate]' }
+
+              foreach ($copy in $found) {
+                  $actual = Get-OnDiskFileVersion -Path $copy.FullName
+                  $where  = $copy.FullName.Substring($BHoMRoot.Length).TrimStart('\')
+
+                  Write-Host ("::notice::{0}: baseline={1} new={2} onDisk={3}{4}" -f $where, $shownBaseline, $expected, $actual, $marker)
+
+                  if ($actual -ne $expected) {
+                      $failures += "$where is $actual on disk but the new MSI declares $expected"
+                  }
+                  elseif ($discriminates -and $actual -eq $baseline) {
+                      $failures += "$where still carries the baseline version $baseline after the upgrade"
+                  }
+              }
+          }
+
+          if ($checked -eq 0) {
+              throw "No probe file could be checked at all, so this assertion ran on nothing. Probes tried: $($probes -join ', ')."
+          }
+
+          if ($discriminating -eq 0) {
+              throw "No probe has a different version in the baseline and the new package, so this assertion cannot distinguish a correct upgrade from a stale file. It would pass either way. Update the probe list in this step rather than accepting the green. Probes tried: $($probes -join ', ')."
+          }
+
+          if ($failures.Count -gt 0) {
+              $failures | ForEach-Object { Write-Host "::error::$_" }
+              throw "File content was not replaced by the upgrade: $($failures.Count) probe(s) wrong. The path set matched, so assertion 4 could not see this."
+          }
+
+          Write-Host "::notice::Content verified on $checked installed file(s) across $discriminating discriminating probe(s) of $($probes.Count) tried."
+
+      - name: 'Assert repair after upgrade restores the same tree'
+        # ASSERTION 6 of 9. Repair runs against the installed product's own
+        # component bookkeeping, so this is where an inconsistency written by the
+        # upgrade surfaces. One extra transaction, and it covers the repair half of
+        # the upgrade-path risk this job exists for.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          $product = @(Get-BHoMProducts)[0]
+          Assert-ProductCode -Value $product -Context 'repair assertion'
+          Write-Host "Repairing $product"
+          $rc = Invoke-Msi -Arguments @('/f', $product) -LogName 'd-repair.log'
+          Write-Host "::notice::/f exit code: $rc"
+          if ($rc -ne 0) { throw "Repair of $product after the upgrade failed with exit $rc" }
+
+          $reference = @(Get-Content 'tree-a.txt')
+          $repaired  = @(Get-BHoMTree)
+          $delta = @(Compare-Object -ReferenceObject $reference -DifferenceObject $repaired)
+          if ($delta.Count) {
+              $delta | ForEach-Object { Write-Host "::error::Repair delta [$($_.SideIndicator)]: $($_.InputObject)" }
+              throw "Repair after upgrade changed the installed tree in $($delta.Count) place(s). The upgraded install's component bookkeeping does not describe what is on disk."
+          }
+          Write-Host "::notice::Repair left the tree identical to a clean install."
+
+      - name: 'Assert uninstall after upgrade leaves nothing behind'
+        # ASSERTION 7 of 9. Reference-count leaks and orphaned directories surface
+        # here and nowhere else: this is the only point in either workflow where a
+        # product that arrived by upgrade is then removed.
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'bhom-upgrade-helpers.ps1')
+          foreach ($code in @(Get-BHoMProducts)) {
+              Write-Host "Removing $code"
+              $rc = Invoke-Msi -Arguments @('/x', $code) -LogName 'e-final-uninstall.log'
+              if ($rc -ne 0) { throw "Uninstall of upgraded product $code failed with exit $rc" }
+          }
+
+          $left = @(Get-BHoMProducts)
+          if ($left.Count -ne 0) {
+              $left | ForEach-Object { Write-Host "::error::Still registered: $_" }
+              throw "Uninstall after upgrade left $($left.Count) product(s) registered."
+          }
+
+          $residue = @(Get-BHoMTree)
+          if ($residue.Count -ne 0) {
+              $residue | ForEach-Object { Write-Host "::error::Residual file after uninstalling an upgraded install: $_" }
+              throw "Uninstall after upgrade left $($residue.Count) file(s) under C:\ProgramData\BHoM. Phase A proved a clean install uninstalls cleanly, so this is specific to the upgrade path."
+          }
+          Write-Host "::notice::Uninstall after upgrade left no products and no files."
+
+      - name: 'Assert no fatal markers in any log'
+        # ASSERTION 8 of 9. Same three patterns and the same reasoning as
+        # install-test's equivalent step: bare 'returned actual error code 1603'
+        # lines are non-fatal by design where a custom action is marked
+        # Continue="yes", and the genuinely fatal cases produce 'Return value 3' or
+        # 'MainEngineThread is returning 1603'.
+        #
+        # Runs across every transaction in the job, so a failure in a phase whose
+        # exit code happened to be 0 is still caught.
+        if: always()
+        run: |
+          $patterns = @(
+              'Return value 3',
+              'MainEngineThread is returning 1603',
+              'SFXCA: Failed'
+          )
+          $logs = @(Get-ChildItem -Filter '*.utf8.log' -File)
+          if ($logs.Count -eq 0) {
+              Write-Host "::warning::No converted logs present, so this step asserted nothing. An earlier step must have failed before any msiexec transaction ran."
+              exit 0
+          }
+          $failed = $false
+          foreach ($log in $logs) {
+              $hits = Select-String -Path $log.FullName -Pattern $patterns
+              if ($hits) {
+                  $failed = $true
+                  $hits | ForEach-Object { Write-Host "::error::$($log.Name): $($_.Line.Trim())" }
+              }
+          }
+          if ($failed) { throw "Fatal markers found in one or more upgrade-test logs" }
+          Write-Host "::notice::No fatal markers across $($logs.Count) log(s)."
+
+      # ASSERTION 9 of 9, in the sense that matters: the evidence survives the run.
+      # Unconditional, because the logs are most valuable exactly when the job failed.
+      - name: Upload upgrade-test logs and tree snapshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: upgrade-test-logs-${{ github.run_id }}
+          # Every input is workspace-relative so the common ancestor stays the
+          # workspace root and the artefact layout stays flat.
+          path: |
+            *.log
+            *.utf8.log
+            tree-a.txt
+            tree-c.txt
+          if-no-files-found: warn
+          retention-days: 14
+
   # Publish the .msi as a preserved per-build GitHub Release. The flavour
   # is determined by what triggered the run, normalised in the resolve job:
   #
@@ -657,7 +1279,7 @@ jobs:
   # "Upload installer artefact" Actions artifact for local debugging.
   publish:
     name: Publish ${{ needs.resolve.outputs.release_type }} release
-    needs: [resolve, build, install-test, admin-install-test]
+    needs: [resolve, build, install-test, admin-install-test, upgrade-test]
     # Skipped when should_publish=false (scheduled nightly + rule 3 soft trip:
     # v{M}.{N}.0 already shipped on this line). Build + install-test still ran
     # to preserve the smoke signal; the post-ship-bump-needed job below opens
