@@ -1432,30 +1432,27 @@ jobs:
           make_latest: ${{ needs.resolve.outputs.make_latest }}
           prerelease:  ${{ needs.resolve.outputs.prerelease }}
 
-  # Open a GitHub Issue when an unattended build fails, so the breakage does
-  # not rot silently. Fires on:
-  #   schedule    Scheduled nightly. Nobody is watching at 00:45 UTC.
-  # Does NOT fire on workflow_dispatch failures (alpha, alpha-beta, or beta) because
-  # the human who triggered the run is already watching the Actions tab.
-  notify-on-failure:
-    name: Open issue on failed nightly build
-    needs: [build, install-test]
-    if: failure() && github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
-      - name: Checkout installer repo (for the notify script)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          fetch-depth: 1
-          sparse-checkout: |
-            scripts/notify-on-failure.sh
-          sparse-checkout-cone-mode: false
-
-      - name: Open or update tracking issue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BUILD_RESULT: ${{ needs.build.result }}
-          TEST_RESULT:  ${{ needs.install-test.result }}
-        run: bash scripts/notify-on-failure.sh
+  # There is deliberately no notify-on-failure job here. Removed by decision
+  # ahead of the WiX tooling upgrade, which rebuilds this workflow.
+  #
+  # It is NOT removed because it worked. It did not: its `needs` omitted the
+  # `resolve` job, so a resolve failure left `build` and `install-test` as
+  # `skipped`, `failure()` never became true, and the nightly failed silently --
+  # which is the case the job existed to catch. The fix was known and was never
+  # applied here.
+  #
+  # Two consequences, recorded so neither is discovered by accident:
+  #
+  #   1. `scripts/notify-on-failure.sh` is deliberately KEPT. It is not dead.
+  #      Its remaining consumer is a downstream installer workflow in a separate
+  #      repository, which checks this repo out as a sibling and runs the script
+  #      from there. Deleting it breaks that build, not this one.
+  #
+  #   2. That downstream job is correct and stays: it carries the `resolve`
+  #      dependency and the explicit per-job result conditions this one lacked.
+  #      The two builds now differ deliberately -- downstream reports an
+  #      unattended failure, this one does not report at all.
+  #
+  # An unattended nightly with no failure reporting is a known, accepted gap for
+  # the duration of the upgrade. Whatever replaces this workflow has to decide
+  # again whether to report, and on what condition.
