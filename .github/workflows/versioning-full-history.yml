@@ -32,9 +32,35 @@
 #   are immutable and the test framework evolves additively (new datasets,
 #   new upgraders), so running today's framework against an older .msi
 #   surfaces latent regressions that the framework caught up to identify
-#   after the release shipped. The runner's IsFromLoadedNamespace filter
-#   scopes out tests for types the older .msi cannot load, so new-dataset
-#   noise is handled at runtime without false positives.
+#   after the release shipped.
+#
+# CORRECTION 2026-08-11:
+#   This header previously claimed the runner's IsFromLoadedNamespace filter
+#   "scopes out tests for types the older .msi cannot load, so new-dataset
+#   noise is handled at runtime without false positives". That is false.
+#   Measured on run 31406949629, the only substantive run this workflow has
+#   ever produced: Error / 42,132 failures, of which 39,072 are counted real
+#   via DeclaringTypeNotLoaded. The filter does not do this.
+#
+#   The 42,132 decompose with no residue, scored against the release's own
+#   IncludedDLLs.txt (234 entries) on the recorded DeclaringAssembly field:
+#
+#     39,244 (93%)  declare against an assembly the .msi never shipped, because
+#                   fleet-wide datasets are scored against one installer payload
+#      2,853  (7%)  record no declaring assembly at all
+#         35        signature-level and present in the .msi, all of which are
+#                   deliberate declared deletions, not regressions
+#          0        genuine regressions
+#
+#   Those 35 fail because a namespace rename earlier in the upgrade walk
+#   rewrites the lookup key, so the later MessageForDeleted entry keyed on the
+#   original name never matches and is silently skipped. That is upstream in
+#   Versioning_Toolkit / Versioning_Engine, not here. See CI_Toolkit#151.
+#
+#   Until that is fixed this workflow cannot report green, and a red conclusion
+#   here must NOT be read as a statement about the release. Do not add a
+#   workaround to VersioningRunner: the framework owns this rule and implements
+#   it correctly, and a second implementation would diverge from it.
 #
 # Does not gate any PR (per the 2026-06-15 architecture review: full-history
 # is the ecosystem-wide catch-everything safety net, while the per-PR
